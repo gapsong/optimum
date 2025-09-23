@@ -18,7 +18,7 @@ import os
 from enum import Enum
 from logging import getLogger
 from typing import Any, Dict, List, Optional, Tuple, Union
-
+from safetensors import safe_open  # Falls safetensors verwendet wird; sonst load_file aus transformers
 import torch
 from packaging import version
 from torch import nn
@@ -186,7 +186,9 @@ class GPTQQuantizer(object):
         self.quant_method = QuantizationMethod.GPTQ
         self.cache_block_outputs = cache_block_outputs
         self.modules_in_block_to_quantize = modules_in_block_to_quantize
-
+        self.lr_layers = {}  # Dict zum Speichern aller LR-Matrizen: {"layer_name": lr_tensor}
+        self.apply_error_correction = False
+        
         self.serialization_keys = [
             "bits",
             "dataset",
@@ -219,6 +221,7 @@ class GPTQQuantizer(object):
                     f"Only supported versions are in [ExllamaVersion.ONE, ExllamaVersion.TWO] - not recognized version {version}"
                 )
         self.exllama_version = self.exllama_config["version"]
+        self.lr_layers = None
 
     def select_quant_linear(self, device_map: Union[str, dict], pack: bool = False):
         if is_gptqmodel_available():
@@ -385,7 +388,139 @@ class GPTQQuantizer(object):
                 setattr(module, attr, new_layer.to(device))
         for name1, child in module.named_children():
             self._replace_by_quant_layers(child, names, name + "." + name1 if name != "" else name1)
+    
+    def load_all_lr_layers(self, adapter_path):
+        """
+        Lädt einen gespeicherten LoRA-Adapter, extrahiert lora_A und lora_B,
+        berechnet den Skalierungsfaktor und rekonstruiert die Low-Rank-Update-Matrix für alle Layer.
+        Speichert alles in self.lr_layers.
+        """
+        # 1. Pfade zur Konfigurations- und Gewichtsdatei definieren
+        config_path = os.path.join(adapter_path, "adapter_config.json")
+        weights_path = os.path.join(adapter_path, "adapter_model.safetensors")
 
+        if not os.path.exists(config_path) or not os.path.exists(weights_path):
+            print(f"❌ Fehler: Konnte 'adapter_config.json' oder 'adapter_model.safetensors' nicht in {adapter_path} finden.")
+            return
+
+        # 2. Konfiguration laden, um 'r' und 'lora_alpha' zu erhalten
+        print(f"🔍 Lade Konfiguration von: {config_path}")
+        with open(config_path, "r") as f:
+            adapter_config = json.load(f)
+
+        r = adapter_config.get("r")
+        lora_alpha = adapter_config.get("lora_alpha")
+        use_rslora = adapter_config.get("use_rslora", False)
+
+        if r is None or lora_alpha is None:
+            print("❌ Fehler: 'r' oder 'lora_alpha' nicht in der Konfiguration gefunden.")
+            return
+
+        # 3. Den 'scaling'-Parameter berechnen
+        if use_rslora:
+            scaling = lora_alpha / torch.sqrt(torch.tensor(r))
+            print(f"✅ Konfiguration geladen: r={r}, lora_alpha={lora_alpha} (rsLoRA-Skalierung verwendet)")
+        else:
+            scaling = lora_alpha / r
+            print(f"✅ Konfiguration geladen: r={r}, lora_alpha={lora_alpha}")
+        
+        print(f"   Berechneter Skalierungsfaktor: {scaling:.4f}\n")
+
+        # 4. Das State Dictionary des Adapters laden
+        print(f"🔍 Lade Gewichte von: {weights_path}")
+        # Verwende safe_open für safetensors
+        adapter_state_dict = {}
+        lr_layers = {}
+        with safe_open(weights_path, framework="pt") as f:
+            for key in f.keys():
+                adapter_state_dict[key] = f.get_tensor(key)
+        print(f"✅ {len(adapter_state_dict)} Tensoren geladen.\n")
+
+        # 5. Durch alle Layer iterieren und die Low-Rank-Matrix rekonstruieren
+        # Finde alle lora_A Gewichte, um die Layer zu identifizieren
+        lora_a_keys = [key for key in adapter_state_dict if key.endswith(".lora_A.weight")]
+
+        for lora_a_key in lora_a_keys:
+            base_key = lora_a_key.replace(".lora_A.weight", "")
+            lora_b_key = base_key + ".lora_B.weight"
+
+            if lora_b_key in adapter_state_dict:
+                lora_A = adapter_state_dict[lora_a_key]
+                lora_B = adapter_state_dict[lora_b_key]
+                
+                # Dies ist die Kernlogik Ihrer Anfrage
+                # LR = scaling * (B @ A)
+                low_rank_update = scaling * (lora_B @ lora_A)
+                
+                # Speichere im Dict (base_key ist der Layer-Name, z.B. "q_proj")
+                # layer_name = base_key.split(".")[-1]  # Extrahiere z.B. "q_proj" aus "model.layers.0.self_attn.q_proj"
+                cleaned_keys = base_key.replace("base_model.model.model.layers.","")
+                lr_layers[cleaned_keys] = low_rank_update
+                
+                print(f"--- Rekonstruiert für Layer: {base_key} ---")
+                print(f"  - lora_A Form: {lora_A.shape}")
+                print(f"  - lora_B Form: {lora_B.shape}")
+                print(f"  - Rekonstruierte LR-Matrix Form: {low_rank_update.shape}\n")
+
+        print(f"✅ Alle LR-Layer geladen und in self.lr_layers gespeichert: {list(lr_layers.keys())}")
+        
+        return lr_layers
+
+    @torch.no_grad()
+    def update_block_weights(self, block, block_index, layers_in_block, add=True):
+        """
+        Aktualisiert die Gewichte eines Blocks, indem die Low-Rank-Updates aus self.lr_layers addiert (oder subtrahiert) werden.
+
+        Args:
+            block (nn.Module): Der Transformer-Block, der aktualisiert werden soll.
+            block_index (int): Der Index des Blocks im Modell (z.B. 0 für den ersten Block).
+            layers_in_block (List[List[str]]): Eine Liste von Layernamen innerhalb des Blocks, die aktualisiert werden könnten.
+                                              Beispiel: [['self_attn.q_proj'], ['self_attn.v_proj']]
+            add (bool): Wenn True, werden die Updates addiert. Wenn False, werden sie subtrahiert.
+        """
+        # 1. Hole das state_dict des Blocks. Wir werden dieses modifizieren und dann wieder laden.
+        sd = block.state_dict()
+        
+        # 2. Iteriere durch alle Layer, die potenziell quantisiert werden sollen.
+        #    Die `layers_in_block` ist eine Liste von Listen, also flachen wir sie ab.
+        all_layer_names = [name for sublist in layers_in_block for name in sublist]
+
+        for layer_name in all_layer_names:
+            # 3. Konstruiere den Schlüssel für dein `lr_layers` Dictionary.
+            #    Beispiel: "0.self_attn.q_proj"
+            lr_key = f"{block_index}.{layer_name}"
+
+            # 4. Prüfe, ob für diesen Layer ein Low-Rank-Update existiert.
+            if lr_key in self.lr_layers:
+                
+                # 5. Konstruiere den Schlüssel für das `state_dict` des Blocks.
+                #    Dies ist der entscheidende Schritt: Wir hängen ".weight" an.
+                #    Beispiel: "self_attn.q_proj.weight"
+                param_key = f"{layer_name}.weight"
+
+                if param_key in sd:
+                    # 6. Hole das Low-Rank-Delta und das Ziel-Parameter-Tensor.
+                    delta = self.lr_layers[lr_key]
+                    param = sd[param_key]
+                    
+                    # Stelle sicher, dass beide auf demselben Gerät und vom selben Typ sind.
+                    delta = delta.to(device=param.device, dtype=param.dtype)
+                    
+                    # 7. Addiere oder subtrahiere das Update.
+                    if add:
+                        sd[param_key].add_(delta)
+                        print(f"✅ Update für Block {block_index}, Layer {param_key} HINZUGEFÜGT.")
+                    else:
+                        sd[param_key].sub_(delta)
+                        print(f"✅ Update für Block {block_index}, Layer {param_key} ENTFERNT.")
+                else:
+                    print(f"⚠️ Warnung: Parameter '{param_key}' nicht im state_dict von Block {block_index} gefunden.")
+            
+        # 8. Lade das modifizierte state_dict zurück in den Block.
+        #    `strict=False` ist sicherer, falls das state_dict zusätzliche Schlüssel enthält.
+        block.load_state_dict(sd, strict=False)
+
+            
     @torch.no_grad()
     def quantize_model(self, model: nn.Module, tokenizer: Optional[Any] = None):
         """
@@ -572,6 +707,10 @@ class GPTQQuantizer(object):
 
         # Step 3: Quantize the blocks
         quantizers = {}
+        if not self.lr_layers and self.apply_error_correction:
+            adapter_path = "/home/nudel/Documents/peft/train_results_debugger/quantized_residuals_r128/daniel_adapter_r128_TinyLlama_TinyLlama_v1.1"
+            self.lr_layers = self.load_all_lr_layers(adapter_path)
+
         for i, block in enumerate(tqdm(blocks, desc=f"Quantizing {self.block_name_to_quantize} blocks ")):
             logger.info(f"Start quantizing block {self.block_name_to_quantize} {i + 1}/{len(blocks)}")
 
@@ -612,6 +751,7 @@ class GPTQQuantizer(object):
                 handles = []
                 # add hook for each layer in subset_layers
                 for name in subset_layers:
+                    # hier wird das layer GPTQ quantisiert
                     gptq[name] = GPTQ(subset_layers[name])
                     gptq[name].quantizer.configure(bits=self.bits, sym=self.sym, perchannel=True)
 
@@ -624,6 +764,9 @@ class GPTQQuantizer(object):
                     # because it adding a hook will replace the old one.
                     handles.append(subset_layers[name].register_forward_hook(add_batch(name)))
                 # update Hessian for each layer in subset_layers thanks to the hook
+                if self.apply_error_correction:
+                    self.update_block_weights(block, i, layers_name_list, True)
+
                 for j in range(len(dataset)):
                     # the args are already on the gpu
                     # don't need to store the output
@@ -632,6 +775,9 @@ class GPTQQuantizer(object):
                         layer_input_kwargs[j][k] = nested_move_to(v, block_device)
 
                     block(*layer_inputs[j], **layer_input_kwargs[j])
+                if self.apply_error_correction:
+                    self.update_block_weights(block, i, layers_name_list, False)
+
                 # remove hook
                 for h in handles:
                     h.remove()
