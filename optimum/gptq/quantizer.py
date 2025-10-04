@@ -187,7 +187,7 @@ class GPTQQuantizer(object):
         self.cache_block_outputs = cache_block_outputs
         self.modules_in_block_to_quantize = modules_in_block_to_quantize
         self.lr_layers = {}  # Dict zum Speichern aller LR-Matrizen: {"layer_name": lr_tensor}
-        self.apply_error_correction = False
+        self.apply_error_correction = True 
         
         self.serialization_keys = [
             "bits",
@@ -522,7 +522,7 @@ class GPTQQuantizer(object):
 
             
     @torch.no_grad()
-    def quantize_model(self, model: nn.Module, tokenizer: Optional[Any] = None):
+    def quantize_model(self, model: nn.Module, tokenizer: Optional[Any] = None, adapter_path:str = None):
         """
         Quantizes the model using the dataset
 
@@ -708,7 +708,7 @@ class GPTQQuantizer(object):
         # Step 3: Quantize the blocks
         quantizers = {}
         if not self.lr_layers and self.apply_error_correction:
-            adapter_path = "/home/nudel/Documents/peft/train_results_debugger/quantized_residuals_r128/daniel_adapter_r128_TinyLlama_TinyLlama_v1.1"
+            # adapter_path = "/home/nudel/Documents/peft/train_results_debugger/quantized_residuals_r128/daniel_adapter_r128_TinyLlama_TinyLlama_v1.1"
             self.lr_layers = self.load_all_lr_layers(adapter_path)
 
         for i, block in enumerate(tqdm(blocks, desc=f"Quantizing {self.block_name_to_quantize} blocks ")):
