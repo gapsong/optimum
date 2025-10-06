@@ -194,6 +194,52 @@ def get_c4_new(tokenizer: Any, seqlen: int, nsamples: int, split: str = "train")
 
     return dataset
 
+# UPDATED FUNCTION
+def get_alpaca_cleaned(tokenizer: Any, seqlen: int, nsamples: int, split: str = "train"):
+    if not is_datasets_available():
+        raise ImportError(DATASETS_IMPORT_ERROR.format("get_alpaca_cleaned"))
+
+    # The alpaca-cleaned dataset only has a 'train' split.
+    data = load_dataset("yahma/alpaca-cleaned", split="train")
+    
+    # To align with the wikitext2 approach, we'll take a fixed number of samples,
+    # concatenate them, and then sample from the tokenized result.
+    # We use 2000 samples because Alpaca entries are generally shorter than wikitext articles.
+    data = data.select(range(2000))
+
+    all_texts = []
+    for sample in data:
+        # Format the text based on the presence of an 'input' field.
+        if sample.get("input", "") != "":
+            text = f"Instruction: {sample['instruction']}\nInput: {sample['input']}\nResponse: {sample['output']}"
+        else:
+            text = f"Instruction: {sample['instruction']}\nResponse: {sample['output']}"
+        all_texts.append(text)
+    
+    # Join all formatted texts into a single block, separated by a double newline
+    concatenated_text = "\n\n".join(all_texts)
+    
+    # Tokenize the entire text block at once
+    enc = tokenizer(concatenated_text, return_tensors="pt")
+
+    dataset = []
+    for _ in range(nsamples):
+        # Ensure the total tokenized text is long enough to sample from
+        if enc.input_ids.shape[1] <= seqlen:
+            raise ValueError(
+                f"The tokenized text of the {len(data)} Alpaca samples is shorter ({enc.input_ids.shape[1]} tokens) "
+                f"than the required sequence length ({seqlen}). Please use a smaller `seqlen`."
+            )
+
+        # Select a random slice from the tokenized text
+        i = random.randint(0, enc.input_ids.shape[1] - seqlen - 1)
+        j = i + seqlen
+        inp = enc.input_ids[:, i:j]
+        attention_mask = torch.ones_like(inp)
+        dataset.append({"input_ids": inp, "attention_mask": attention_mask})
+
+    return dataset
+
 
 def get_ptb(tokenizer: Any, seqlen: int, nsamples: int, split: str = "train"):
     raise RuntimeError("Loading the `ptb` dataset was deprecated")
@@ -232,6 +278,8 @@ def get_dataset(
         "wikitext2": get_wikitext2,
         "c4": get_c4,
         "c4-new": get_c4_new,
+        "alpaca-cleaned": get_alpaca_cleaned,
+
     }
     if split not in ["train", "validation"]:
         raise ValueError(f"The split need to be 'train' or 'validation' but found {split}")

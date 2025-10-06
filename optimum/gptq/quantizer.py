@@ -707,7 +707,7 @@ class GPTQQuantizer(object):
 
         # Step 3: Quantize the blocks
         quantizers = {}
-        if not self.lr_layers and self.apply_error_correction:
+        if not self.lr_layers and self.apply_error_correction and adapter_path is not None:
             # adapter_path = "/home/nudel/Documents/peft/train_results_debugger/quantized_residuals_r128/daniel_adapter_r128_TinyLlama_TinyLlama_v1.1"
             self.lr_layers = self.load_all_lr_layers(adapter_path)
 
@@ -764,7 +764,7 @@ class GPTQQuantizer(object):
                     # because it adding a hook will replace the old one.
                     handles.append(subset_layers[name].register_forward_hook(add_batch(name)))
                 # update Hessian for each layer in subset_layers thanks to the hook
-                if self.apply_error_correction:
+                if self.apply_error_correction and adapter_path is not None:
                     self.update_block_weights(block, i, layers_name_list, True)
 
                 for j in range(len(dataset)):
@@ -775,7 +775,7 @@ class GPTQQuantizer(object):
                         layer_input_kwargs[j][k] = nested_move_to(v, block_device)
 
                     block(*layer_inputs[j], **layer_input_kwargs[j])
-                if self.apply_error_correction:
+                if self.apply_error_correction and adapter_path is not None:
                     self.update_block_weights(block, i, layers_name_list, False)
 
                 # remove hook
