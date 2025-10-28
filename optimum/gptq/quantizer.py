@@ -667,7 +667,210 @@ class GPTQQuantizer(object):
                     raise ValueError(f"Module {module_name} was not found in model")
                 module = module.to(to_device)
             blocks[0] = blocks[0].to(to_device)
+        import matplotlib.pyplot as plt
 
+        @torch.no_grad()
+        def detect_spqr_outliers(W, H, outlier_percentile=0.99, bits=4, percdamp=0.01):
+            """
+            FINALE VERSION: Verwendet einen adaptiven Schwellenwert, um einen festen Prozentsatz
+            der Spalten mit dem höchsten Fehler als Ausreißer zu identifizieren.
+
+            Args:
+                W (torch.Tensor): Die originale Gewichtsmatrix (float32).
+                H (torch.Tensor): Die ORIGINALE Hessian-Matrix (float32).
+                outlier_percentile (float): Das Perzentil, das als Schwellenwert verwendet wird.
+                                            0.99 bedeutet: "Markiere die Top 1% als Ausreißer".
+                                            0.98 bedeutet: "Markiere die Top 2% als Ausreißer".
+                bits (int): Anzahl der Bits für die Quantisierungssimulation.
+                percdamp (float): Dämpfung für den Hessian.
+            """
+            
+            # --- 1. Quantisierte Gewichte für die gesamte Matrix vorberechnen ---
+            q_max = 2**(bits - 1) - 1
+            scales = W.abs().max(dim=0, keepdim=True)[0] / q_max
+            scales.clamp_(min=1e-5)
+            W_q = torch.round(W / scales).clamp(-q_max, q_max) * scales
+            
+            # --- 2. Fehlerbeitrag für JEDE SPALTE berechnen und speichern ---
+            num_cols = W.shape[1]
+            column_errors = torch.zeros(num_cols, device=W.device)
+
+            for j in range(num_cols):
+                h_val = H[j, j].clone()
+                h_val += percdamp * H.diagonal().abs().mean()
+                if h_val == 0: h_val = 1.0
+                
+                transform_scalar = torch.sqrt(h_val)
+                error_col = W[:, j] - W_q[:, j]
+                whitened_error = error_col * transform_scalar
+                column_error_contribution = torch.sum(whitened_error**2)
+                column_errors[j] = column_error_contribution
+
+            # --- 3. ADAPTIVEN Schwellenwert berechnen ---
+            # Der Schwellenwert ist das 99. Perzentil aller Fehlerbeiträge.
+            # Alle Spalten, deren Fehler größer ist, gehören zu den Top 1%.
+            adaptive_threshold = torch.quantile(column_errors, outlier_percentile)
+
+            # --- 4. Maske basierend auf dem adaptiven Schwellenwert erstellen ---
+            # Dies ist eine Vektor-Operation und viel schneller als eine Schleife.
+            is_outlier_column = column_errors > adaptive_threshold
+            outlier_mask = torch.zeros_like(W, dtype=torch.bool)
+            outlier_mask[:, is_outlier_column] = True
+
+            # --- 5. Optional: Visualisierung der Fehler und des adaptiven Schwellenwerts ---
+            # plt.figure(figsize=(12, 5))
+            # plt.plot(column_errors.cpu().numpy(), marker='.', linestyle='-')
+            # plt.axhline(y=adaptive_threshold.cpu().item(), color='r', linestyle='--', label=f'Adaptiver Threshold ({outlier_percentile*100:.0f}. Perzentil)')
+            # plt.xlabel("Spalten-Index (Column Index)")
+            # plt.ylabel("Fehlerbeitrag der Spalte")
+            # plt.title(f"Fehlerbeiträge pro Spalte (Adaptive Methode)")
+            # plt.legend()
+            # plt.yscale('log')
+            # plt.tight_layout()
+            # plt.show()
+
+            if outlier_mask.any():
+                num_outlier_cols = outlier_mask.sum().item() // W.shape[0]
+                percent_outliers = (num_outlier_cols / num_cols) * 100
+                print(f"INFO: V6 (Adaptive) detected {outlier_mask.sum()} outliers in {num_outlier_cols} columns ({percent_outliers:.2f}%).")
+                
+            return outlier_mask
+
+        @torch.no_grad()
+        def process_outliers_for_saving(outlier_mask, adjusted_outliers_W, svd_rank=32):
+            """
+            Processes the outlier matrix to create two saveable formats: sparse and SVD.
+
+            Args:
+                outlier_mask (torch.Tensor): The boolean mask of outlier positions.
+                adjusted_outliers_W (torch.Tensor): The full weight matrix containing adjusted outlier values.
+                svd_rank (int): The rank for the SVD approximation.
+
+            Returns:
+                dict: A dictionary containing the processed data for both formats.
+            """
+            # Create the dense outlier matrix O
+            O = torch.zeros_like(adjusted_outliers_W)
+            O[outlier_mask] = adjusted_outliers_W[outlier_mask]
+            
+            # --- 1. Sparse Format (for PEFT-like adapter) ---
+            # Convert the boolean mask to COO format indices
+            sparse_indices = outlier_mask.nonzero().t()  # Shape: (2, num_outliers)
+            sparse_values = O[outlier_mask]
+            
+            # --- 2. SVD Format ---
+            try:
+                U, S, Vh = torch.linalg.svd(O.to(torch.float32), full_matrices=False)
+                
+                # Truncate to the specified rank
+                U_k = U[:, :svd_rank]
+                S_k = S[:svd_rank]
+                Vh_k = Vh[:svd_rank, :]
+                
+                svd_components = {
+                    "U": U_k.cpu(),
+                    "S": S_k.cpu(),
+                    "Vh": Vh_k.cpu()
+                }
+            except torch.linalg.LinAlgError:
+                print("WARNING: SVD did not converge. Skipping SVD format for this layer.")
+                svd_components = None
+
+            return {
+                "sparse": {
+                    "indices": sparse_indices.cpu(),
+                    "values": sparse_values.cpu()
+                },
+                "svd": svd_components
+            }
+
+        def visualize_and_save_weights(
+            W: torch.Tensor, 
+            outlier_mask: torch.Tensor, 
+            layer_name: str, 
+            base_save_dir: str = "spqr_visualizations"
+        ):
+            """
+            Erstellt und speichert verbesserte Visualisierungen der Gewichtsmatrizen und Ausreißer
+            mit adaptiven Farbskalen.
+
+            Args:
+                W (torch.Tensor): Die originale, volle Gewichtsmatrix (auf der CPU oder GPU).
+                outlier_mask (torch.Tensor): Die boolesche Maske, die die Positionen der Ausreißer anzeigt.
+                layer_name (str): Ein eindeutiger Name für die Schicht (z.B. "block_16_o_proj").
+                base_save_dir (str): Das Hauptverzeichnis, in dem die Ergebnisse gespeichert werden.
+            """
+            print(f"Erstelle verbesserte Visualisierungen für Schicht: {layer_name}...")
+            
+            # --- 1. Daten vorbereiten und auf die CPU verschieben ---
+            W_cpu = W.detach().float().cpu()
+            mask_cpu = outlier_mask.detach().cpu()
+            
+            W_for_gptq = W_cpu.clone()
+            W_for_gptq[mask_cpu] = 0.0
+            
+            O_sparse = torch.zeros_like(W_cpu)
+            outlier_values = W_cpu[mask_cpu]
+            O_sparse[mask_cpu] = outlier_values
+            
+            layer_dir = os.path.join(base_save_dir, layer_name)
+            os.makedirs(layer_dir, exist_ok=True)
+            
+            # --- 2. Plots mit angepassten Skalen erstellen ---
+
+            # Skala 1: Für die dichten Matrizen (ignoriert die Top/Bottom 1% der extremsten Werte)
+            # Dies enthüllt die Struktur der "normalen" Gewichte.
+            vmin_dense = torch.quantile(W_cpu, 0.01).item()
+            vmax_dense = torch.quantile(W_cpu, 0.99).item()
+            
+            # Plot 1: Originale Gewichte (mit adaptiver Skala)
+            plt.figure(figsize=(12, 9))
+            plt.imshow(W_cpu.numpy(), cmap='coolwarm', aspect='auto', vmin=vmin_dense, vmax=vmax_dense)
+            plt.colorbar(label="Gewichtswert")
+            plt.title(f"1. Originale Gewichte (Angepasste Skala)\n{layer_name}")
+            plt.xlabel("Eingangs-Features (Input Features)")
+            plt.ylabel("Ausgangs-Features (Output Features)")
+            plt.savefig(os.path.join(layer_dir, "01_original_weights.png"), bbox_inches='tight', dpi=150)
+            plt.close()
+
+            # Plot 2: Gewichte für GPTQ (mit adaptiver Skala)
+            plt.figure(figsize=(12, 9))
+            plt.imshow(W_for_gptq.numpy(), cmap='coolwarm', aspect='auto', vmin=vmin_dense, vmax=vmax_dense)
+            plt.colorbar(label="Gewichtswert")
+            plt.title(f"2. Gewichte für GPTQ (Ausreißer auf Null)\n{layer_name}")
+            plt.xlabel("Eingangs-Features")
+            plt.ylabel("Ausgangs-Features")
+            plt.savefig(os.path.join(layer_dir, "02_weights_for_gptq.png"), bbox_inches='tight', dpi=150)
+            plt.close()
+
+            # Skala 2: Für die Sparse-Matrix (fokussiert auf die Ausreißer)
+            # Macht die Skala symmetrisch um Null, um die Ausreißer hervorzuheben.
+            if outlier_values.numel() > 0:
+                v_abs_max = outlier_values.abs().max().item()
+                vmin_sparse, vmax_sparse = -v_abs_max, v_abs_max
+            else:
+                vmin_sparse, vmax_sparse = -1, 1 # Fallback, falls keine Ausreißer da sind
+            import numpy as np
+            # Plot 3: Nur die Ausreißer (mit fokussierter Skala)
+            plt.figure(figsize=(12, 9))
+            # Wir verwenden hier np.ma.masked_where, um die Nullen transparent zu machen.
+            # Das hebt die Struktur der Ausreißer noch besser hervor.
+            masked_sparse = np.ma.masked_where(O_sparse.numpy() == 0, O_sparse.numpy())
+            
+            # Hintergrundfarbe des Plots auf neutrales Grau setzen
+            ax = plt.gca()
+            ax.set_facecolor('gray')
+            
+            plt.imshow(masked_sparse, cmap='coolwarm', aspect='auto', vmin=vmin_sparse, vmax=vmax_sparse)
+            plt.colorbar(label="Wert des Ausreißers")
+            plt.title(f"3. Nur die Ausreißer (Fokussierte Skala)\n{layer_name}")
+            plt.xlabel("Eingangs-Features")
+            plt.ylabel("Ausgangs-Features")
+            plt.savefig(os.path.join(layer_dir, "03_outliers_sparse.png"), bbox_inches='tight', dpi=150)
+            plt.close()
+            
+            print(f"Verbesserte Visualisierungen für '{layer_name}' wurden in '{layer_dir}' gespeichert.")
+    
         def store_input_hook(_, input, *args):
             kwargs = args[0]
             if input is None:
@@ -707,6 +910,8 @@ class GPTQQuantizer(object):
 
         # Step 3: Quantize the blocks
         quantizers = {}
+        outlier_adapter = {}
+
         if not self.lr_layers and self.apply_error_correction and adapter_path is not None:
             # adapter_path = "/home/nudel/Documents/peft/train_results_debugger/quantized_residuals_r128/daniel_adapter_r128_TinyLlama_TinyLlama_v1.1"
             self.lr_layers = self.load_all_lr_layers(adapter_path)
@@ -782,18 +987,58 @@ class GPTQQuantizer(object):
                 for h in handles:
                     h.remove()
                 for name in subset_name_list:
-                    logger.info(f"Quantizing {name} in block {i + 1}/{len(blocks)}...")
+                    logger.info(f"Applying SPQR outlier detection for {name} in block {i + 1}...")
+
+                    W = subset_layers[name].weight.data.clone().float()
+                    H = gptq[name].H
+                    
+                    # Ensure Hessian is invertible
+                    dead_neurons = torch.diag(H) == 0
+                    H[dead_neurons, dead_neurons] = 1
+
+                    # 1. Detect outliers using the SPQR-inspired logic
+                    outlier_mask = detect_spqr_outliers(W, H, outlier_percentile=0.99, bits=self.bits)
+                    # if outlier_mask.any():
+                    #     # Erstelle einen sauberen, dateisystem-freundlichen Namen für die Schicht
+                    #     clean_layer_name = f"block_{i}_{name.replace('.', '_')}"
+                        
+                    #     # Rufe die Visualisierungs-Funktion auf
+                    #     visualize_and_save_weights(W, outlier_mask, clean_layer_name)
+                    # 2. Zero out outliers in the main weight matrix before GPTQ
+                    W_for_gptq = W.clone()
+                    W_for_gptq[outlier_mask] = 0.0
+                    gptq[name].module.weight.data = W_for_gptq.to(gptq[name].module.weight.data.dtype)
+
+                    # 3. Run GPTQ quantization
+                    logger.info(f"Quantizing {name} with GPTQ...")
                     quant_outputs = gptq[name].fasterquant(
                         percdamp=self.damp_percent, group_size=self.group_size, actorder=self.desc_act
                     )
                     scale, zero, g_idx = quant_outputs[0], quant_outputs[1], quant_outputs[2]
-                    quantizers[f"{self.block_name_to_quantize}.{i}.{name}"] = (
-                        gptq[name].quantizer,
-                        scale,
-                        zero,
-                        g_idx,
+                    full_layer_name = f"{self.block_name_to_quantize}.{i}.{name}"
+
+                    # The main quantizers dictionary for standard GPTQ params
+                    quantizers[full_layer_name] = (
+                        None, scale, zero, g_idx
                     )
+
+                    # 4. Process the adjusted outliers into sparse and SVD formats
+                    if outlier_mask.any():
+                        logger.info(f"Processing outliers for {name} into sparse and SVD formats...")
+                        adjusted_outliers_W = gptq[name].module.weight.data
+                        
+                        outlier_formats = process_outliers_for_saving(
+                            outlier_mask.to(adjusted_outliers_W.device),
+                            adjusted_outliers_W,
+                            svd_rank=1
+                        )
+                        
+                        # Store both formats. You can decide which one to use later.
+                        outlier_adapter[full_layer_name] = outlier_formats
+
+
                     gptq[name].free()
+        
                 del subset_layers
             # we get the new output from the partial quantized block
             if self.cache_block_outputs:
@@ -836,6 +1081,14 @@ class GPTQQuantizer(object):
                     "Setting `disable_exllama=True`. You should only use Exllamav2 backend for inference. "
                 )
                 self.disable_exllama = True
+            
+        if outlier_adapter: # Nur speichern, wenn Ausreißer gefunden wurden
+            adapter_save_path = "spqr_outlier_adapter.pt"
+            logger.info(f"Saving outlier adapter with {len(outlier_adapter)} layers to {adapter_save_path}...")
+            torch.save(outlier_adapter, adapter_save_path)
+        else:
+            logger.info("No outliers found, skipping adapter saving.")
+    
         # Step 4: Pack the model at the end (Replacing the layers)
         self.pack_model(model=model, quantizers=quantizers)
 
