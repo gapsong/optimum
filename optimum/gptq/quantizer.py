@@ -1101,6 +1101,13 @@ class GPTQQuantizer(object):
         # Step 5: Any post-initialization that require device information, for example buffers initialization on device.
         model = self.post_init_model(model)
 
+        if outlier_adapter:
+            logger.info(f"Injecting outlier adapter with {len(outlier_adapter)} layers into the model object.")
+            # Wir fügen den Adapter als Attribut hinzu.
+            # Wichtig: Wir registrieren es nicht als nn.Module, damit es nicht automatisch
+            # im state_dict landet.
+            model.spqr_adapter = outlier_adapter
+
         torch.cuda.empty_cache()
         if hasattr(torch, "xpu") and torch.xpu.is_available():
             torch.xpu.empty_cache()
