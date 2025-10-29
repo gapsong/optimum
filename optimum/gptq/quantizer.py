@@ -76,6 +76,168 @@ class ExllamaVersion(int, Enum):
     TWO = 2
 
 
+# Neu: benötigte Quant-Funktionen importieren
+
+from .quant_groups import quantize, dequantize
+
+@torch.no_grad()
+def _compute_H_inv_cholesky(H: torch.Tensor, percdamp: float) -> torch.Tensor:
+    """
+    Regularisiert H, invertiert via Cholesky und liefert die Cholesky-Faktorisierung
+    von H^{-1} (upper=True), wie in GPTQ üblich.
+    """
+    H = H.clone()
+    dead = torch.diag(H) == 0
+    H[dead, dead] = 1.0
+
+    damp = percdamp * torch.diag(H).abs().mean()
+    idx = torch.arange(H.shape[0], device=H.device)
+    H[idx, idx] += damp
+
+    L = torch.linalg.cholesky(H)
+    H_inv = torch.cholesky_inverse(L)
+    H_inv_cho = torch.linalg.cholesky(H_inv, upper=True)
+    return H_inv_cho
+
+
+@torch.no_grad()
+def refit_outliers_after_gptq(
+    W_orig: torch.Tensor,
+    H: torch.Tensor,
+    scale: torch.Tensor,
+    zero: torch.Tensor,
+    g_idx: Optional[torch.Tensor],
+    outlier_mask: torch.Tensor,
+    bits: int,
+    percdamp: float,
+    group_size: int,
+):
+    """
+    Spaltenweises Refitting wie in SpQR/SPQRUtil:
+
+    - quantisiert/dequantisiert nur Nicht-Outlier einer Spalte mit (scale, zero, g_idx)
+    - setzt die Spaltenwerte: Nicht-Outlier = quantisiert, Outlier = aktueller Float-Wert
+
+    - berechnet den whitened Residual E_j und propagiert ihn in spätere Spalten
+
+    Gibt zurück: W_adj (angepasste Gewichte mit 16-bit Outliers), H_inv_cho
+    """
+    dev = W_orig.device
+    W = W_orig.detach().clone().float()
+    out_dim, in_dim = W.shape
+
+    # 1) H^{-1/2} via Cholesky (upper)
+    H_inv_cho = _compute_H_inv_cholesky(H, percdamp=percdamp)
+    d = torch.diag(H_inv_cho)
+
+    # 2) pro Spalte quantisieren (nur Nicht-Outlier), dann Residual propagieren
+    maxq = 2 ** (bits - 1) - 1
+
+    def _group_for_col(j: int) -> int:
+        # g_idx bevorzugen, sonst aus group_size ableiten
+        if g_idx is not None and isinstance(g_idx, torch.Tensor) and g_idx.numel() == in_dim:
+            return int(g_idx[j].item())
+        if group_size is None or group_size <= 0 or group_size == -1:
+            return 0
+        return j // group_size
+
+    for j in range(in_dim):
+        group_j = _group_for_col(j)
+
+        # Skalen/Zeros für die Spalte j (per-channel)
+        s_j = scale[:, group_j].unsqueeze(1)  # [out_dim, 1]
+        z_j = zero[:, group_j].unsqueeze(1)   # [out_dim, 1]
+
+        wj = W[:, j].unsqueeze(1)             # [out_dim, 1]
+        mask_j = outlier_mask[:, j].unsqueeze(1).float()  # [out_dim, 1]
+        non_outlier = (1.0 - mask_j)
+
+        # Nur Nicht-Outlier quantisieren + dequantisieren
+        q_j = quantize(wj * non_outlier, s_j, z_j, maxq)
+        wq_j = dequantize(q_j, s_j, z_j).squeeze(1)  # [out_dim]
+
+        # Spalte setzen: Nicht-Outlier = quantisiert; Outlier = originaler Float
+        W[:, j] = wq_j * non_outlier.squeeze(1) + W[:, j] * mask_j.squeeze(1)
+
+        # whitened Residual nur für Nicht-Outlier
+        delta_j = (wj.squeeze(1) - wq_j) * non_outlier.squeeze(1)  # [out_dim]
+        Ej = delta_j / d[j]  # [out_dim]
+
+        # Residual in spätere Spalten propagieren
+        if j + 1 < in_dim:
+            W[:, j + 1:] -= Ej.unsqueeze(1) * H_inv_cho[j, j + 1:]
+
+    return W, H_inv_cho
+
+
+def get_leave_one_out_error(group_weight: torch.Tensor,
+                            group_diag_hinv_cho: torch.Tensor,
+                            *,
+                            bits: int,
+                            sym: bool = True):
+    """
+    Berechnet pro Element die Fehlerreduktion, wenn dieses Element als Outlier behandelt wird.
+    (SPQR-ähnlicher Leave-One-Out Score)
+
+    Args:
+        group_weight: [out_dim, g] Gewichte der aktuellen Gruppe (g = group_size).
+        group_diag_hinv_cho: [g] diag(cholesky(H_inv)) für die g Spalten dieser Gruppe.
+        bits: Basis-Bitbreite für die Quantisierung.
+        sym: Symmetrische Quantisierung (wie in deinem Quantizer üblich).
+
+    Returns:
+        reduction_in_squared_error: [out_dim, g]
+            (baseline_error_sq - loo_error_sq) pro Gewicht. Höher = nützlicher als Outlier.
+    """
+    assert group_weight.ndim == 2, f"Erwartet 2D, bekam {group_weight.shape}"
+    out_dim, g = group_weight.shape
+    assert group_diag_hinv_cho.ndim == 1 and group_diag_hinv_cho.numel() == g, \
+        f"group_diag_hinv_cho muss 1D Länge g sein, bekam {group_diag_hinv_cho.shape}"
+
+    # 1) Indizes für Leave-One-Out: für jede Spalte j, alle anderen Spalten
+    #    Erzeuge eine [g, g-1]-Indexmatrix: in Zeile j stehen die Spalten != j.
+    loo_indices = []
+    for j in range(g):
+        idx = torch.cat([torch.arange(0, j, device=group_weight.device),
+                         torch.arange(j + 1, g, device=group_weight.device)])
+        loo_indices.append(idx)
+    loo_indices = torch.stack(loo_indices, dim=0)  # [g, g-1]
+
+    # 2) Leave-One-Out Daten: [out_dim, g, g-1]
+    groupwise_loo_data = group_weight[:, loo_indices]  # advanced indexing erzeugt neue Achse
+
+    # 3) Quantizer für Leave-One-Out fitten (ein Fit für alle g LOO-Fälle gleichzeitig)
+    #    Verwende deinen Quantizer (perchannel=True) auf [out_dim*g, g-1].
+    from .quant_groups import Quantizer  # passe ggf. Import an
+    fast_quantizer = Quantizer(shape=groupwise_loo_data.flatten(0, 1).shape)
+    fast_quantizer.configure(bits, perchannel=True, sym=sym)
+    fast_quantizer.find_params(groupwise_loo_data.flatten(0, 1), weight=True)
+
+    # Rekonstruiere leave-one-out Gewichte und forme zurück zu [out_dim, g, g-1]
+    loo_reconstructed = fast_quantizer.quantize_dequantize(
+        groupwise_loo_data.flatten(0, 1)
+    ).reshape_as(groupwise_loo_data)
+
+    # 4) Whitening-Faktoren für die LOO-Batches: [g, g-1]
+    loo_group_diag_hinv_cho = group_diag_hinv_cho[loo_indices]
+
+    # LOO-Fehler: Summe der hessian-gewichteten MSE über die verbleibenden (g-1) Spalten
+    # Ergebnis: [out_dim, g]
+    loo_errors_sq = ((loo_reconstructed - groupwise_loo_data) / loo_group_diag_hinv_cho).square().sum(dim=-1)
+
+    # 5) Baseline: normal quantisieren ohne Outliers auf [out_dim, g]
+    base_quantizer = Quantizer(shape=group_weight.shape)
+    base_quantizer.configure(bits, perchannel=True, sym=sym)
+    base_quantizer.find_params(group_weight, weight=True)
+    baseline_reconstructed = base_quantizer.quantize_dequantize(group_weight)
+
+    baseline_errors_sq = ((baseline_reconstructed - group_weight) / group_diag_hinv_cho).square().sum(dim=1, keepdim=True)
+    # 6) Nutzen als Outlier = wie stark sinkt der Fehler, wenn dieses Gewicht ein Outlier bleibt
+    reduction_in_squared_error = baseline_errors_sq - loo_errors_sq  # [out_dim, g]
+    return reduction_in_squared_error
+
+
+
 class GPTQQuantizer(object):
     r"""
     A simple API for GPTQ Quantization
@@ -669,6 +831,39 @@ class GPTQQuantizer(object):
             blocks[0] = blocks[0].to(to_device)
         import matplotlib.pyplot as plt
 
+
+        @torch.no_grad()
+        def detect_spqr_outliers_weightwise_loo(W, H, bits=4, lambda_=1e-2, group_size=16, target_rate=0.000001, sym=True):
+            """
+            Markiert Elemente mit größter Fehlerreduktion (Leave-One-Out) als Outliers.
+            target_rate bezieht sich auf die Elemente in der Gruppe (nicht nur Spalten).
+            """
+            # Whitening
+            I = torch.eye(H.shape[0], device=H.device, dtype=H.dtype)
+            L = torch.linalg.cholesky(H + lambda_ * I)
+            Hinv = torch.cholesky_inverse(L)
+            Hinv_cho = torch.linalg.cholesky(Hinv, upper=True)
+            d = torch.diag(Hinv_cho)
+
+            out, inp = W.shape
+            mask = torch.zeros_like(W, dtype=torch.bool)
+
+            for c0 in range(0, inp, group_size):
+                c1 = min(c0 + group_size, inp)
+                G = W[:, c0:c1]  # [out, g]
+                # Leave-One-Out Nutzen (höher = stärkerer Outlier-Kandidat)
+                reduction = get_leave_one_out_error(G, d[c0:c1], bits=bits, sym=sym)  # [out, g]
+
+                # Wähle Top-k Elemente in dieser Gruppe nach target_rate
+                k = max(1, int(reduction.numel() * target_rate))
+                flat = reduction.reshape(-1)
+                topk_idx = torch.topk(flat, k, largest=True).indices
+                rows = topk_idx // (c1 - c0)
+                cols = topk_idx %  (c1 - c0)
+                mask[rows, c0 + cols] = True
+
+            return mask
+
         @torch.no_grad()
         def detect_spqr_outliers(W, H, outlier_percentile=0.99, bits=4, percdamp=0.01):
             """
@@ -778,7 +973,7 @@ class GPTQQuantizer(object):
 
             return {
                 "sparse": {
-                    "indices": sparse_indices.cpu(),
+                    "outlier_mask": outlier_mask.cpu(),
                     "values": sparse_values.cpu()
                 },
                 "svd": svd_components
@@ -997,19 +1192,16 @@ class GPTQQuantizer(object):
                     H[dead_neurons, dead_neurons] = 1
 
                     # 1. Detect outliers using the SPQR-inspired logic
-                    outlier_mask = detect_spqr_outliers(W, H, outlier_percentile=0.99, bits=self.bits)
-                    # if outlier_mask.any():
-                    #     # Erstelle einen sauberen, dateisystem-freundlichen Namen für die Schicht
-                    #     clean_layer_name = f"block_{i}_{name.replace('.', '_')}"
-                        
-                    #     # Rufe die Visualisierungs-Funktion auf
-                    #     visualize_and_save_weights(W, outlier_mask, clean_layer_name)
-                    # 2. Zero out outliers in the main weight matrix before GPTQ
-                    W_for_gptq = W.clone()
-                    W_for_gptq[outlier_mask] = 0.0
-                    gptq[name].module.weight.data = W_for_gptq.to(gptq[name].module.weight.data.dtype)
+                    outlier_mask = detect_spqr_outliers_weightwise_loo(
+                        W, H, bits=self.bits, group_size=self.group_size, sym=self.sym
+                    )
 
-                    # 3. Run GPTQ quantization
+                    # --- 2) NICHT global auf 0 setzen; stattdessen mit Original-Gewichten GPTQ laufen lassen ---
+
+                    gptq[name].module.weight.data = W.to(gptq[name].module.weight.data.dtype)
+
+                    # --- 3) GPTQ: Skalen/Zeros/Gruppen holen ---
+
                     logger.info(f"Quantizing {name} with GPTQ...")
                     quant_outputs = gptq[name].fasterquant(
                         percdamp=self.damp_percent, group_size=self.group_size, actorder=self.desc_act
@@ -1017,25 +1209,30 @@ class GPTQQuantizer(object):
                     scale, zero, g_idx = quant_outputs[0], quant_outputs[1], quant_outputs[2]
                     full_layer_name = f"{self.block_name_to_quantize}.{i}.{name}"
 
-                    # The main quantizers dictionary for standard GPTQ params
-                    quantizers[full_layer_name] = (
-                        None, scale, zero, g_idx
+                    # --- 4) Refitting der Outliers nach GPTQ ---
+
+                    W_adj, _ = refit_outliers_after_gptq(
+                        W_orig=W,
+                        H=H,
+                        scale=scale,
+                        zero=zero,
+                        g_idx=g_idx,
+                        outlier_mask=outlier_mask,
+                        bits=self.bits,
+                        percdamp=self.damp_percent,
+                        group_size=self.group_size,
                     )
 
-                    # 4. Process the adjusted outliers into sparse and SVD formats
+                    # --- 5) Outlier-Werte aus W_adj speichern (angepasste 16-bit Outliers) ---
+
                     if outlier_mask.any():
                         logger.info(f"Processing outliers for {name} into sparse and SVD formats...")
-                        adjusted_outliers_W = gptq[name].module.weight.data
-                        
                         outlier_formats = process_outliers_for_saving(
-                            outlier_mask.to(adjusted_outliers_W.device),
-                            adjusted_outliers_W,
-                            svd_rank=1
+                            outlier_mask.to(W_adj.device),
+                            W_adj,
+                            svd_rank=128
                         )
-                        
-                        # Store both formats. You can decide which one to use later.
                         outlier_adapter[full_layer_name] = outlier_formats
-
 
                     gptq[name].free()
         
