@@ -1233,7 +1233,9 @@ class GPTQQuantizer(object):
                             svd_rank=128
                         )
                         outlier_adapter[full_layer_name] = outlier_formats
-
+                    quantizers[full_layer_name] = (
+                        gptq[name], scale, zero, g_idx
+                    )
                     gptq[name].free()
         
                 del subset_layers
