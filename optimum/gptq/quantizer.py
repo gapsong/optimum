@@ -174,6 +174,9 @@ class SPQRUtil:
         save_quant_dict = {}
         perm = get_permutation_order(self.H, weight, permutation_order)
 
+        scale = []
+        zero = []
+        
         if save_quantization:
             save_quant_dict["quant_weights"] = []
             save_quant_dict["quant_layer_scale"] = []
@@ -327,6 +330,12 @@ class SPQRUtil:
                     weight_i_quantized = (
                         weight_i_quantized_wo_outliers * (1 - is_outlier) + weight[:, column_index] * is_outlier
                     )  # [out_dim]
+                    
+                    
+                    scale.append(quantizer.scale)
+                    zero.append(quantizer.zero)
+                    
+                    save_quant_dict["quant_layer_scale"]
 
                     if save_quantization:
                         save_quant_dict["outliers_matrix"][:, column_index] = weight[:, column_index] * is_outlier
@@ -354,6 +363,10 @@ class SPQRUtil:
                 alpha=-1,
             )
 
+        g_idx = [i // groupsize for i in range(self.columns)]
+
+        g_idx = torch.tensor(g_idx, dtype=torch.int32, device=weight.device)
+
         if permutation_order != "identity":
             invperm = torch.argsort(perm)
             weight = weight[:, invperm]
@@ -361,7 +374,7 @@ class SPQRUtil:
         if save_quantization:
             save_quant_dict["perm"] = perm.to(torch.int32)
             save_quant_dict["keep_last_columns"] = 0
-            save_quant_dict["g_idx"] = in_group_index
+            save_quant_dict["g_idx"] = g_idx
             save_quant_dict["weight_shape"] = weight.shape
             save_quant_dict["groupsize"] = groupsize if groupsize else weight.shape[1]
             save_quant_dict["quant_weights"] = torch.cat(save_quant_dict["quant_weights"], dim=1)
@@ -825,7 +838,8 @@ class GPTQQuantizer(object):
                     )
 
                     scale, zero, g_idx  = res.save_quant_dict["quant_layer_scale"], res.save_quant_dict["quant_layer_zeros"], res.save_quant_dict["g_idx"]
-                    
+                    scale = torch.cat(scale, dim=1)
+                    zero = torch.cat(zero, dim=1)
                     quantizers[f"{self.block_name_to_quantize}.{block_index}.{name}"] = (
                         spqr[name],
                         scale,
