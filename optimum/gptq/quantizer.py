@@ -12,6 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# Neu: benötigte Quant-Funktionen importieren
+from __future__ import annotations
 import importlib
 import json
 import os
@@ -76,100 +79,303 @@ class ExllamaVersion(int, Enum):
     TWO = 2
 
 
-# Neu: benötigte Quant-Funktionen importieren
 
-from .quant_groups import quantize, dequantize
+import math
+from typing import NamedTuple, Optional, Union
 
-@torch.no_grad()
-def _compute_H_inv_cholesky(H: torch.Tensor, percdamp: float) -> torch.Tensor:
-    """
-    Regularisiert H, invertiert via Cholesky und liefert die Cholesky-Faktorisierung
-    von H^{-1} (upper=True), wie in GPTQ üblich.
-    """
-    H = H.clone()
-    dead = torch.diag(H) == 0
-    H[dead, dead] = 1.0
+import torch
+from tqdm.auto import tqdm
 
-    damp = percdamp * torch.diag(H).abs().mean()
-    idx = torch.arange(H.shape[0], device=H.device)
-    H[idx, idx] += damp
+from .weight_permutation import get_permutation_order
 
-    L = torch.linalg.cholesky(H)
-    H_inv = torch.cholesky_inverse(L)
-    H_inv_cho = torch.linalg.cholesky(H_inv, upper=True)
-    return H_inv_cho
+from .quant_groups import quantize, dequantize, Quantizer
 
 
-@torch.no_grad()
-def refit_outliers_after_gptq(
-    W_orig: torch.Tensor,
-    H: torch.Tensor,
-    scale: torch.Tensor,
-    zero: torch.Tensor,
-    g_idx: Optional[torch.Tensor],
-    outlier_mask: torch.Tensor,
-    bits: int,
-    percdamp: float,
-    group_size: int,
-):
-    """
-    Spaltenweises Refitting wie in SpQR/SPQRUtil:
 
-    - quantisiert/dequantisiert nur Nicht-Outlier einer Spalte mit (scale, zero, g_idx)
-    - setzt die Spaltenwerte: Nicht-Outlier = quantisiert, Outlier = aktueller Float-Wert
+class QuantizationResult(NamedTuple):
+    """A collection of codebooks, indices and assorted statistics produced by SPQRUtil; not memory-optimized!"""
 
-    - berechnet den whitened Residual E_j und propagiert ihn in spätere Spalten
+    weight: torch.FloatTensor  # dequantized(quantized(weight)), same shape as the original
+    perm: Optional[torch.LongTensor]  # optional input permutation indices that were used during quantization
+    # NOTE: if permutation_order != identity, all subsequent tensors (incl. outlier indices) are permuted in that order!
 
-    Gibt zurück: W_adj (angepasste Gewichte mit 16-bit Outliers), H_inv_cho
-    """
-    dev = W_orig.device
-    W = W_orig.detach().clone().float()
-    out_dim, in_dim = W.shape
-
-    # 1) H^{-1/2} via Cholesky (upper)
-    H_inv_cho = _compute_H_inv_cholesky(H, percdamp=percdamp)
-    d = torch.diag(H_inv_cho)
-
-    # 2) pro Spalte quantisieren (nur Nicht-Outlier), dann Residual propagieren
-    maxq = 2 ** (bits - 1) - 1
-
-    def _group_for_col(j: int) -> int:
-        # g_idx bevorzugen, sonst aus group_size ableiten
-        if g_idx is not None and isinstance(g_idx, torch.Tensor) and g_idx.numel() == in_dim:
-            return int(g_idx[j].item())
-        if group_size is None or group_size <= 0 or group_size == -1:
-            return 0
-        return j // group_size
-
-    for j in range(in_dim):
-        group_j = _group_for_col(j)
-
-        # Skalen/Zeros für die Spalte j (per-channel)
-        s_j = scale[:, group_j].unsqueeze(1)  # [out_dim, 1]
-        z_j = zero[:, group_j].unsqueeze(1)   # [out_dim, 1]
-
-        wj = W[:, j].unsqueeze(1)             # [out_dim, 1]
-        mask_j = outlier_mask[:, j].unsqueeze(1).float()  # [out_dim, 1]
-        non_outlier = (1.0 - mask_j)
-
-        # Nur Nicht-Outlier quantisieren + dequantisieren
-        q_j = quantize(wj * non_outlier, s_j, z_j, maxq)
-        wq_j = dequantize(q_j, s_j, z_j).squeeze(1)  # [out_dim]
-
-        # Spalte setzen: Nicht-Outlier = quantisiert; Outlier = originaler Float
-        W[:, j] = wq_j * non_outlier.squeeze(1) + W[:, j] * mask_j.squeeze(1)
-
-        # whitened Residual nur für Nicht-Outlier
-        delta_j = (wj.squeeze(1) - wq_j) * non_outlier.squeeze(1)  # [out_dim]
-        Ej = delta_j / d[j]  # [out_dim]
-
-        # Residual in spätere Spalten propagieren
-        if j + 1 < in_dim:
-            W[:, j + 1:] -= Ej.unsqueeze(1) * H_inv_cho[j, j + 1:]
-
-    return W, H_inv_cho
+    quantization_errors: torch.Tensor  # per-element quantization errors, defined as (weight - quantized_weight) / diag(inverse_hessian_cholesky)
+    unstructured_outlier_threshold: float  # threshold on squared error increase used for determining *UNSTRUCTURED* outliers
+    unstructured_outlier_mask: torch.Tensor  # bool mask where True means that this is an individual outlier
+    save_quant_dict: dict
 
 
+class SPQRUtil:
+    """Learns GPTQ for a single linear layer"""
+
+    def __init__(self, layer):
+        self.layer = layer
+        self.dev = layer.weight.device
+        self.columns = self.layer.weight.data.shape[1]
+        self.H = torch.zeros((self.columns, self.columns), device=self.dev)
+        self.nsamples = 0
+
+    def add_batch(self, inp):
+        assert self.H is not None, "Already ran quantization; cannot add more data batches"
+        if len(inp.shape) == 2:
+            inp = inp.unsqueeze(0)
+        tmp = inp.shape[0]
+
+        if len(inp.shape) == 3:
+            inp = inp.reshape((-1, inp.shape[-1]))
+        inp = inp.t()
+
+        self.H *= self.nsamples / (self.nsamples + tmp)
+        self.nsamples += tmp
+        inp = math.sqrt(2 / self.nsamples) * inp.float()
+        self.H += inp.matmul(inp.t())
+
+    def quantize(
+        self,
+        *,
+        bits: int = 2,
+        blocksize: int = 128,
+        percdamp: float = 1e-2,
+        groupsize: Optional[int] = None,
+        keep_last_columns: int = 0,
+        outlier_relative_threshold: float = float("inf"),
+        permutation_order: Union[str, torch.Tensor] = "identity",
+        keep_H: bool = True,
+        simplified_outliers: bool = False,
+        verbose=True,
+        perchannel: bool = True,
+        sym: bool = False,
+        save_quantization: bool = False,
+        **kwargs,
+    ) -> QuantizationResult:
+        """
+        :param bits: number of bits used at the lowest level (the full model size will be different!)
+        :param blocksize: take blocks of this many input features at a time for GPTQ
+        :note: blocksize affects runtime and memory, but does not affect the resulting matrix (up to machine precision)
+        :param groupsize: fit quantization scaling / statistics to each group of this many input features
+        :param percdamp: relative regularizer added to hessian diagonal before inversion
+        :note: if groupsize_in_dim* is None, use the same quantization statistics across all input features
+        :param keep_last_columns: if not None, keep the last (this many) input features un_quantized and return them
+        :note: the un-quantized columns will be a part of the first returned result
+        :param outlier_relative_threshold: threshold used for *UNSTRUCTURED* outliers, relative to
+        :note: if keep_last_columns > 0, quantized_dequantized_weights[-keep_last_columns:] will be non-quantized
+        :param permutation_order: re-order input features using a certain policy
+        :param keep_H: if False, delete the accumulated hessian during quantize; if False, keep the accumulated hessian
+        :param simplified_outliers: if True,do not perform leave-one-out evaluation when detecting outliers;
+            works faster, but generally worse in perplexity
+        :param verbose: if True, display a tqdm progressbar over input columns
+        :param sym: if True, base weight quantization is symmetric
+        :param perchannel: if True, base weight quantization will learn statistics for each output dimension separately
+        :return: a QuantizationResult tuple that contains(
+            weight, perm, _unused, _unused, _unused, _unused, quantization_errors, outlier_unstructured_mask
+        ), see class QuantizationResult below for details
+        """
+        weight = self.layer.weight.detach().to(dtype=torch.float, copy=True)
+        save_quant_dict = {}
+        perm = get_permutation_order(self.H, weight, permutation_order)
+
+        if save_quantization:
+            save_quant_dict["quant_weights"] = []
+            save_quant_dict["quant_layer_scale"] = []
+            save_quant_dict["quant_layer_zeros"] = []
+            save_quant_dict["quant_layer_scale_qq_scale"] = []
+            save_quant_dict["quant_layer_scale_qq_zero"] = []
+            save_quant_dict["quant_layer_zero_qq_scale"] = []
+            save_quant_dict["quant_layer_zero_qq_zero"] = []
+            save_quant_dict["save_float_dtype"] = self.layer.weight.dtype
+            save_quant_dict["outliers_matrix"] = torch.zeros(
+                weight.shape, dtype=save_quant_dict["save_float_dtype"]
+            ).to(
+                weight.device
+            )  # shape = [out_features, in_features]
+
+        weight = weight[:, perm]  # note: weight is modified
+        H = self.H
+        if keep_H:
+            H = H.clone()  # protect from in-place changes
+        else:
+            self.H = None
+
+        H = H[perm][:, perm]
+        self.dead = torch.diag(H) == 0  # indices of input features that do not affect outputs
+        if percdamp > 0:
+            ix = torch.arange(len(H), device=weight.device)
+            H[ix, ix] += percdamp * abs(torch.diag(H)).mean()
+            del ix
+        H[self.dead, self.dead] = 1
+        weight[:, self.dead] = 0
+        H_inv = torch.cholesky_inverse(torch.linalg.cholesky(H))
+        H_inv_cho = torch.linalg.cholesky(H_inv, upper=True)
+        H_inv_cho_diag = torch.diag(H_inv_cho)
+        del H
+
+        quantizer = Quantizer()
+        quantizer.configure(bits, perchannel=perchannel, sym=sym, **kwargs)
+        assert H_inv_cho.shape[0] == H_inv_cho.shape[1] == weight.shape[1], "weight must be [out_features, in_features]"
+        out_dim, in_dim = weight.shape  # [out_features, in_features]
+
+        if groupsize is None:
+            groupsize = in_dim
+
+        # prepare outlier detection
+        outlier_column_indices = torch.empty(0, dtype=torch.int64, device=weight.device)
+        del H_inv
+
+        outlier_scale = (weight.var(dim=0) / torch.diag(H_inv_cho).square()).mean().item()
+        unstructured_outlier_threshold = outlier_relative_threshold * outlier_scale
+        in_group_index = -1  # index of current group of input features, for group quantizer purposes
+
+        quantization_errors = torch.zeros_like(weight)
+        unstructured_outlier_mask = torch.zeros_like(weight, dtype=torch.bool)
+
+        block_start_iter = range(0, in_dim - keep_last_columns, blocksize)
+        block_start_iter = tqdm(block_start_iter, leave=False) if verbose else block_start_iter
+        for block_start in block_start_iter:
+            block_end = min(block_start + blocksize, in_dim)
+            for column_index in range(block_start, block_end):
+                if column_index % groupsize == 0:
+                    # fit weight quantizer on the upcoming group of weight columns (inputs), across all rows (outputs)
+                    in_group_index += 1
+                    group_weight = weight[:, column_index : column_index + groupsize]
+
+                    if simplified_outliers or (unstructured_outlier_threshold == float("inf")):
+                        quantizer.find_params(group_weight, weight=True)
+
+                    else:
+                        # objective: detect which weights will be designated as outliers, fit quantizer *without* these weights
+                        # step 1: fit quantizer on a leave-one-out version of weights, i.e. in each group, drop one weight at a time
+                        assert perchannel, "refitting quantizer is only implemented for perchannel=True"
+                        group_diag_hessian_inv_cho = H_inv_cho_diag[column_index : column_index + groupsize]
+                        loo_quantization_error_sq = get_leave_one_out_error(
+                            group_weight, group_diag_hessian_inv_cho, bits=bits, sym=sym
+                        )
+                        # ^-- dequantized(quantized(group_weight)) using a quantizer trained on all weights except the reconstructed one
+
+                        likely_unstructured_outlier_mask = (
+                            loo_quantization_error_sq > unstructured_outlier_threshold
+                        ).float()
+
+                        non_outlier_mask = 1 - likely_unstructured_outlier_mask
+                        mean_over_non_outliers = torch.sum(
+                            group_weight * non_outlier_mask, dim=1, keepdim=True
+                        ) / torch.sum(non_outlier_mask, dim=1, keepdim=True).clamp_min(1)
+                        group_weight_without_outliers = group_weight * non_outlier_mask + mean_over_non_outliers * (
+                            1 - non_outlier_mask
+                        )
+                        quantizer.find_params(group_weight_without_outliers, weight=True)
+                        del group_diag_hessian_inv_cho, loo_quantization_error_sq
+                        del mean_over_non_outliers, group_weight_without_outliers, non_outlier_mask
+
+                    if save_quantization:
+                        if quantizer.qq_scale_bits is not None:
+                            save_quant_dict["quant_layer_scale"].append(quantizer.quant_scale.to(torch.int8))
+                            save_quant_dict["quant_layer_scale_qq_scale"].append(
+                                quantizer.qq_scale.scale.to(save_quant_dict["save_float_dtype"])
+                            )
+                            save_quant_dict["quant_layer_scale_qq_zero"].append(
+                                quantizer.qq_scale.zero.to(save_quant_dict["save_float_dtype"])
+                            )
+                        else:
+                            save_quant_dict["quant_layer_scale"].append(
+                                quantizer.scale.to(save_quant_dict["save_float_dtype"])
+                            )
+
+                        if quantizer.qq_zero_bits is not None and (
+                            (not quantizer.round_zero) or quantizer.qq_zero_bits < quantizer.bits
+                        ):
+                            save_quant_dict["quant_layer_zeros"].append(quantizer.quant_zero.to(torch.int8))
+                            save_quant_dict["quant_layer_zero_qq_scale"].append(
+                                quantizer.qq_zero.scale.to(save_quant_dict["save_float_dtype"])
+                            )
+                            save_quant_dict["quant_layer_zero_qq_zero"].append(
+                                quantizer.qq_zero.zero.to(save_quant_dict["save_float_dtype"])
+                            )
+                        else:
+                            save_quant_dict["quant_layer_zeros"].append(
+                                quantizer.zero.to(save_quant_dict["save_float_dtype"])
+                            )
+                    del group_weight
+
+                weight_quant_i = quantize(
+                    weight[:, column_index].unsqueeze(1), quantizer.scale, quantizer.zero, quantizer.maxq
+                )
+                weight_i_quantized = dequantize(weight_quant_i, quantizer.scale, quantizer.zero).reshape_as(
+                    weight[:, column_index]
+                )
+
+                delta_weight_i = weight[:, column_index] - weight_i_quantized  # [out_dim]
+                quantization_errors[:, column_index] = (
+                    delta_weight_i / H_inv_cho[column_index, column_index]
+                )  # [out_dim]
+
+                if unstructured_outlier_threshold != float("inf"):
+                    unstructured_outlier_mask[:, column_index] = (
+                        quantization_errors[:, column_index].square() > unstructured_outlier_threshold
+                    )
+                    # re-quantize without outliers
+                    is_outlier = unstructured_outlier_mask[:, column_index].float()
+
+                    weight_quant_i = quantize(
+                        (weight[:, column_index] * (1 - is_outlier)).unsqueeze(1),
+                        quantizer.scale,
+                        quantizer.zero,
+                        quantizer.maxq,
+                    )
+                    weight_i_quantized_wo_outliers = dequantize(
+                        weight_quant_i, quantizer.scale, quantizer.zero
+                    ).reshape_as(weight[:, column_index])
+                    weight_i_quantized = (
+                        weight_i_quantized_wo_outliers * (1 - is_outlier) + weight[:, column_index] * is_outlier
+                    )  # [out_dim]
+
+                    if save_quantization:
+                        save_quant_dict["outliers_matrix"][:, column_index] = weight[:, column_index] * is_outlier
+
+                    del weight_i_quantized_wo_outliers
+
+                    delta_weight_i = weight[:, column_index] - weight_i_quantized  # [out_dim]
+                    quantization_errors[:, column_index] = (
+                        delta_weight_i / H_inv_cho[column_index, column_index]
+                    )  # [out_dim]
+
+                if save_quantization:
+                    save_quant_dict["quant_weights"].append(weight_quant_i.to(torch.int8))
+
+                weight[:, column_index] = weight_i_quantized
+                weight[:, column_index + 1 : block_end].addr_(
+                    quantization_errors[:, column_index],
+                    H_inv_cho[column_index, column_index + 1 : block_end],
+                    alpha=-1,
+                )
+
+            weight[:, block_end:].addmm_(
+                quantization_errors[:, block_start:block_end],
+                H_inv_cho[block_start:block_end, block_end:],
+                alpha=-1,
+            )
+
+        if permutation_order != "identity":
+            invperm = torch.argsort(perm)
+            weight = weight[:, invperm]
+
+        if save_quantization:
+            save_quant_dict["perm"] = perm.to(torch.int32)
+            save_quant_dict["keep_last_columns"] = 0
+            save_quant_dict["g_idx"] = in_group_index
+            save_quant_dict["weight_shape"] = weight.shape
+            save_quant_dict["groupsize"] = groupsize if groupsize else weight.shape[1]
+            save_quant_dict["quant_weights"] = torch.cat(save_quant_dict["quant_weights"], dim=1)
+            save_quant_dict["outliers_matrix"] = save_quant_dict["outliers_matrix"].to_sparse()
+
+        return QuantizationResult(
+            weight=weight,
+            perm=perm,
+            quantization_errors=quantization_errors,
+            unstructured_outlier_threshold=unstructured_outlier_threshold,
+            unstructured_outlier_mask=unstructured_outlier_mask,
+            save_quant_dict=save_quant_dict,
+        )
+        
 def get_leave_one_out_error(group_weight: torch.Tensor,
                             group_diag_hinv_cho: torch.Tensor,
                             *,
@@ -266,6 +472,7 @@ class GPTQQuantizer(object):
         checkpoint_format: str = "gptq",
         meta: Optional[Dict[str, any]] = None,
         backend: Optional[str] = None,
+        quant_engine: str = "gptq",
         *args,
         **kwargs,
     ):
@@ -336,6 +543,7 @@ class GPTQQuantizer(object):
         self.checkpoint_format = checkpoint_format.lower()
         self.meta = meta
         self.backend = backend.lower() if backend is not None else None
+        self.quant_engine = (quant_engine or "spqr").lower()
         self.use_cuda_fp16 = use_cuda_fp16
         self.model_seqlen = model_seqlen
         self.block_name_to_quantize = block_name_to_quantize
@@ -363,6 +571,7 @@ class GPTQQuantizer(object):
             "modules_in_block_to_quantize",
             "checkpoint_format",
             "meta",
+            "quant_engine",
         ]
 
         if self.bits not in [2, 3, 4, 8]:
@@ -550,7 +759,82 @@ class GPTQQuantizer(object):
                 setattr(module, attr, new_layer.to(device))
         for name1, child in module.named_children():
             self._replace_by_quant_layers(child, names, name + "." + name1 if name != "" else name1)
-    
+            
+    def _quantize_block_with_spqr(
+            self,
+            block_index: int,
+            block: nn.Module,
+            block_device: Union[torch.device, int],
+            layers_name_list: List[List[str]],
+            dataset: List[Dict[str, torch.Tensor]],
+            layer_inputs: List[Tuple[torch.Tensor]],
+            layer_input_kwargs: List[Dict[str, torch.Tensor]],
+            quantizers: dict
+        ):
+            layers = get_layers(block)
+            logger.info(f"SPQR: Module to quantize {layers_name_list}")
+            for subset_name_list in tqdm(layers_name_list, leave=False, desc="SPQR quantizing layers inside the block"):
+                subset_layers = {name: layers[name] for name in subset_name_list if name in layers}
+                spqr = {}
+                handles = []
+
+                # Hooks, um Eingaben der Layer zu akkumulieren (Hessian via X^T X)
+                for name, layer in subset_layers.items():
+                    if not isinstance(layer, nn.Linear):
+                        logger.info(f"SPQR: Überspringe {name} (Typ {layer.__class__.__name__}), nur nn.Linear wird unterstützt.")
+                        continue
+                    spqr[name] = SPQRUtil(layer)
+
+                    def add_batch_spqr(n):
+                        def _hook(_, inp, out):
+                            try:
+                                x = inp[0].detach()
+                            except Exception:
+                                x = inp[0]
+                            spqr[n].add_batch(x)
+                        return _hook
+
+                    handles.append(layer.register_forward_hook(add_batch_spqr(name)))
+
+                # Hessian-Akkumulation durch Vorwärtsläufe
+                for j in range(len(dataset)):
+                    layer_inputs[j] = nested_move_to(layer_inputs[j], block_device)
+                    for k, v in layer_input_kwargs[j].items():
+                        layer_input_kwargs[j][k] = nested_move_to(v, block_device)
+                    block(*layer_inputs[j], **layer_input_kwargs[j])
+
+                # Hooks entfernen
+                for h in handles:
+                    h.remove()
+
+                # Quantisierung und Gewichtsüberschreibung
+                for name in subset_name_list:
+                    logger.info(f"SPQR: Quantisiere {name} ...")
+                    res = spqr[name].quantize(
+                        bits=self.bits,
+                        # kleiner Blocksize für Stabilität; später tunen
+                        blocksize=self.group_size,
+                        percdamp=self.damp_percent,
+                        # GPTQ: group_size==-1 => per-column; SPQR groupsize=None => ein Group; minimal kompatibel
+                        groupsize=None if self.group_size == -1 else self.group_size,
+                        permutation_order="identity" if not self.desc_act else "identity",  # TODO: act_order später
+                        perchannel=True,
+                        sym=self.sym,
+                        verbose=False,
+                        save_quantization=True
+                    )
+
+                    scale, zero, g_idx  = res.save_quant_dict["quant_layer_scale"], res.save_quant_dict["quant_layer_zeros"], res.save_quant_dict["g_idx"]
+                    
+                    quantizers[f"{self.block_name_to_quantize}.{block_index}.{name}"] = (
+                        spqr[name],
+                        scale,
+                        zero,
+                        g_idx,
+                    )
+
+                del subset_layers, spqr
+                
     def load_all_lr_layers(self, adapter_path):
         """
         Lädt einen gespeicherten LoRA-Adapter, extrahiert lora_A und lora_B,
@@ -703,34 +987,25 @@ class GPTQQuantizer(object):
             `nn.Module`: The quantized model
         """
 
-        if not is_auto_gptq_available() and not is_gptqmodel_available():
-            raise RuntimeError(
-                "gptqmodel or auto-gptq is required in order to perform gptq quantzation: `pip install gptqmodel` or `pip install auto-gptq`. Please notice that auto-gptq will be deprecated in the future."
-            )
-        elif is_gptqmodel_available() and is_auto_gptq_available():
-            logger.warning(
-                "Detected gptqmodel and auto-gptq, will use gptqmodel. The auto_gptq will be deprecated in the future."
-            )
-
-        gptq_supports_cpu = (
-            is_auto_gptq_available()
-            and version.parse(importlib.metadata.version("auto-gptq")) > version.parse("0.4.2")
-        ) or is_gptqmodel_available()
-
-        if not gptq_supports_cpu and not torch.cuda.is_available():
-            raise RuntimeError(
-                "No cuda gpu or cpu support using Intel/IPEX found. A gpu or cpu with Intel/IPEX is required for quantization."
-            )
-
-        if not self.sym and not is_gptqmodel_available():
-            raise ValueError(
-                "Asymmetric sym=False quantization is not supported with auto-gptq. Please use gptqmodel: `pip install gptqmodel`"
-            )
-
-        if self.checkpoint_format == "gptq_v2" and not is_gptqmodel_available():
-            raise ValueError(
-                "gptq_v2 format only supported with gptqmodel. Please install gptqmodel: `pip install gptqmodel`"
-            )
+        if self.quant_engine == "gptq":
+            if not is_auto_gptq_available() and not is_gptqmodel_available():
+                raise RuntimeError(
+                    "gptqmodel oder auto-gptq ist erforderlich für GPTQ-Quantisierung. Installiere `pip install gptqmodel` oder `pip install auto-gptq`."
+                )
+            elif is_gptqmodel_available() and is_auto_gptq_available():
+                logger.warning("Beide gptqmodel und auto-gptq erkannt, nutze gptqmodel.")
+            gptq_supports_cpu = (
+                is_auto_gptq_available()
+                and version.parse(importlib.metadata.version("auto-gptq")) > version.parse("0.4.2")
+            ) or is_gptqmodel_available()
+            if not gptq_supports_cpu and not torch.cuda.is_available():
+                raise RuntimeError("Keine CUDA- oder CPU(IPEX)-Unterstützung für GPTQ-Quantisierung gefunden.")
+            if not self.sym and not is_gptqmodel_available():
+                raise ValueError("Asymmetrisch (sym=False) wird nur von gptqmodel unterstützt.")
+            if self.checkpoint_format == "gptq_v2" and not is_gptqmodel_available():
+                raise ValueError("gptq_v2 Format nur mit gptqmodel.")
+        else:
+            raise ValueError(f"Unbekannter quant_engine: {self.quant_engine}")
 
         model.eval()
 
@@ -1080,7 +1355,9 @@ class GPTQQuantizer(object):
                     other_kwargs[k] = nested_move_to(v, cur_layer_device)
             layer_input_kwargs.append(other_kwargs)
             raise ValueError
-
+        # NEW: SPQR pro-Block Quantisierung
+        
+                
         if self.cache_block_outputs:
             handle = blocks[0].register_forward_pre_hook(store_input_hook, with_kwargs=True)
             for data in dataset:
@@ -1105,15 +1382,8 @@ class GPTQQuantizer(object):
 
         # Step 3: Quantize the blocks
         quantizers = {}
-        outlier_adapter = {}
-
-        if not self.lr_layers and self.apply_error_correction and adapter_path is not None:
-            # adapter_path = "/home/nudel/Documents/peft/train_results_debugger/quantized_residuals_r128/daniel_adapter_r128_TinyLlama_TinyLlama_v1.1"
-            self.lr_layers = self.load_all_lr_layers(adapter_path)
-
         for i, block in enumerate(tqdm(blocks, desc=f"Quantizing {self.block_name_to_quantize} blocks ")):
             logger.info(f"Start quantizing block {self.block_name_to_quantize} {i + 1}/{len(blocks)}")
-
             if not self.cache_block_outputs:
                 handle = block.register_forward_pre_hook(store_input_hook, with_kwargs=True)
                 for data in dataset:
@@ -1124,9 +1394,6 @@ class GPTQQuantizer(object):
                     except ValueError:
                         pass
                 handle.remove()
-
-            # move block to cuda if needed
-            # in case we have offload modules, we need to put them on cuda because of GPTQ object
             if (not has_device_map or get_device(block) == torch.device("cpu")) and has_device_more_than_cpu():
                 block = block.to(0)
             layers = get_layers(block)
@@ -1140,112 +1407,25 @@ class GPTQQuantizer(object):
                     layers_name_list = [sum(self.modules_in_block_to_quantize, [])]
             else:
                 if self.true_sequential:
-                    # lazy sequential but works well
                     layers_name_list = [[key] for key in layers.keys()]
                 else:
                     layers_name_list = [list(layers.keys())]
-            logger.info(f"Module to quantize {layers_name_list}")
-            for subset_name_list in tqdm(layers_name_list, leave=False, desc="Quantizing layers inside the block"):
-                subset_layers = {name: layers[name] for name in subset_name_list}
-                gptq = {}
-                handles = []
-                # add hook for each layer in subset_layers
-                for name in subset_layers:
-                    # hier wird das layer GPTQ quantisiert
-                    gptq[name] = GPTQ(subset_layers[name])
-                    gptq[name].quantizer.configure(bits=self.bits, sym=self.sym, perchannel=True)
-
-                    def add_batch(name):
-                        def tmp(_, input, output):
-                            gptq[name].add_batch(input[0].data, output.data)
-
-                        return tmp
-
-                    # because it adding a hook will replace the old one.
-                    handles.append(subset_layers[name].register_forward_hook(add_batch(name)))
-                # update Hessian for each layer in subset_layers thanks to the hook
-                if self.apply_error_correction and adapter_path is not None:
-                    self.update_block_weights(block, i, layers_name_list, True)
-
-                for j in range(len(dataset)):
-                    # the args are already on the gpu
-                    # don't need to store the output
-                    layer_inputs[j] = nested_move_to(layer_inputs[j], block_device)
-                    for k, v in layer_input_kwargs[j].items():
-                        layer_input_kwargs[j][k] = nested_move_to(v, block_device)
-
-                    block(*layer_inputs[j], **layer_input_kwargs[j])
-                if self.apply_error_correction and adapter_path is not None:
-                    self.update_block_weights(block, i, layers_name_list, False)
-
-                # remove hook
-                for h in handles:
-                    h.remove()
-                for name in subset_name_list:
-                    logger.info(f"Applying SPQR outlier detection for {name} in block {i + 1}...")
-
-                    W = subset_layers[name].weight.data.clone().float()
-                    H = gptq[name].H
-                    
-                    # Ensure Hessian is invertible
-                    dead_neurons = torch.diag(H) == 0
-                    H[dead_neurons, dead_neurons] = 1
-
-                    # 1. Detect outliers using the SPQR-inspired logic
-                    outlier_mask = detect_spqr_outliers_weightwise_loo(
-                        W, H, bits=self.bits, group_size=self.group_size, sym=self.sym
-                    )
-
-                    # --- 2) NICHT global auf 0 setzen; stattdessen mit Original-Gewichten GPTQ laufen lassen ---
-
-                    gptq[name].module.weight.data = W.to(gptq[name].module.weight.data.dtype)
-
-                    # --- 3) GPTQ: Skalen/Zeros/Gruppen holen ---
-
-                    logger.info(f"Quantizing {name} with GPTQ...")
-                    quant_outputs = gptq[name].fasterquant(
-                        percdamp=self.damp_percent, group_size=self.group_size, actorder=self.desc_act
-                    )
-                    scale, zero, g_idx = quant_outputs[0], quant_outputs[1], quant_outputs[2]
-                    full_layer_name = f"{self.block_name_to_quantize}.{i}.{name}"
-
-                    # --- 4) Refitting der Outliers nach GPTQ ---
-
-                    W_adj, _ = refit_outliers_after_gptq(
-                        W_orig=W,
-                        H=H,
-                        scale=scale,
-                        zero=zero,
-                        g_idx=g_idx,
-                        outlier_mask=outlier_mask,
-                        bits=self.bits,
-                        percdamp=self.damp_percent,
-                        group_size=self.group_size,
-                    )
-
-                    # --- 5) Outlier-Werte aus W_adj speichern (angepasste 16-bit Outliers) ---
-
-                    if outlier_mask.any():
-                        logger.info(f"Processing outliers for {name} into sparse and SVD formats...")
-                        outlier_formats = process_outliers_for_saving(
-                            outlier_mask.to(W_adj.device),
-                            W_adj,
-                            svd_rank=128
-                        )
-                        outlier_adapter[full_layer_name] = outlier_formats
-                    quantizers[full_layer_name] = (
-                        gptq[name], scale, zero, g_idx
-                    )
-                    gptq[name].free()
-        
-                del subset_layers
-            # we get the new output from the partial quantized block
+                
+            self._quantize_block_with_spqr(
+                block_index=i,
+                block=block,
+                block_device=block_device,
+                layers_name_list=layers_name_list,
+                dataset=dataset,
+                layer_inputs=layer_inputs,
+                layer_input_kwargs=layer_input_kwargs,
+                quantizers=quantizers
+            )
+            
             if self.cache_block_outputs:
                 for j in range(len(dataset)):
                     layer_output = block(*layer_inputs[j], **layer_input_kwargs[j])
                     layer_outputs.append(layer_output)
-
-                # put back to device
                 if not has_device_map:
                     blocks[i] = block.to(device)
                 del layers
@@ -1258,61 +1438,26 @@ class GPTQQuantizer(object):
             torch.cuda.empty_cache()
             if hasattr(torch, "xpu") and torch.xpu.is_available():
                 torch.xpu.empty_cache()
-
-        if self.bits == 4:
-            # device not on gpu
-            if device.type != "cuda" or (has_device_map and any(d in devices for d in ["cpu", "disk", "hpu"])):
-                if not self.disable_exllama and not is_gptqmodel_available():
-                    logger.warning(
-                        "Found modules on cpu/disk. Using Exllama/Exllamav2 backend requires all the modules to be on GPU. Setting `disable_exllama=True`"
-                    )
-                    self.disable_exllama = True
-            # act order and exllama
-            elif self.desc_act and not self.disable_exllama and self.exllama_version == ExllamaVersion.ONE:
-                logger.warning(
-                    "Using Exllama backend with act_order will reorder the weights offline, thus you will not be able to save the model with the right weights."
-                    "Setting `disable_exllama=True`. You should only use Exllama backend with act_order for inference. "
-                )
-                self.disable_exllama = True
-            elif not self.disable_exllama and self.exllama_version == ExllamaVersion.TWO:
-                logger.warning(
-                    "Using Exllamav2 backend will reorder the weights offline, thus you will not be able to save the model with the right weights."
-                    "Setting `disable_exllama=True`. You should only use Exllamav2 backend for inference. "
-                )
-                self.disable_exllama = True
-            
-        if outlier_adapter: # Nur speichern, wenn Ausreißer gefunden wurden
-            adapter_save_path = "spqr_outlier_adapter.pt"
-            logger.info(f"Saving outlier adapter with {len(outlier_adapter)} layers to {adapter_save_path}...")
-            torch.save(outlier_adapter, adapter_save_path)
+        if self.quant_engine == "gptq":
+            if self.bits == 4:
+                pass
+            self.pack_model(model=model, quantizers=quantizers)
         else:
-            logger.info("No outliers found, skipping adapter saving.")
-    
-        # Step 4: Pack the model at the end (Replacing the layers)
-        self.pack_model(model=model, quantizers=quantizers)
-
+            logger.info("SPQR: Pack-Schritt übersprungen (Gewichte sind bereits quantisiert).")
         model.is_quantized = True
         model.quantization_method = QuantizationMethod.GPTQ
         if has_config:
             model.config.use_cache = use_cache
             model.config.quantization_config = self.to_dict()
-
-        # Step 5: Any post-initialization that require device information, for example buffers initialization on device.
         model = self.post_init_model(model)
-
-        if outlier_adapter:
-            logger.info(f"Injecting outlier adapter with {len(outlier_adapter)} layers into the model object.")
-            # Wir fügen den Adapter als Attribut hinzu.
-            # Wichtig: Wir registrieren es nicht als nn.Module, damit es nicht automatisch
-            # im state_dict landet.
-            model.spqr_adapter = outlier_adapter
-
         torch.cuda.empty_cache()
         if hasattr(torch, "xpu") and torch.xpu.is_available():
             torch.xpu.empty_cache()
         return model
 
     def post_init_model(self, model):
+        if self.quant_engine == "spqr":
+            return model
         """
         Post-initialization that require device information, for example buffers initialization on device.
 
