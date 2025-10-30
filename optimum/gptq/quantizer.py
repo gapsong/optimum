@@ -213,7 +213,7 @@ class SPQRUtil:
         del H
 
         quantizer = Quantizer()
-        quantizer.configure(bits, perchannel=perchannel, sym=sym, **kwargs)
+        quantizer.configure(bits, perchannel=perchannel, round_zero=True, sym=sym, **kwargs)
         assert H_inv_cho.shape[0] == H_inv_cho.shape[1] == weight.shape[1], "weight must be [out_features, in_features]"
         out_dim, in_dim = weight.shape  # [out_features, in_features]
 
