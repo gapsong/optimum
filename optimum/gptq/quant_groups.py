@@ -16,9 +16,9 @@ def dequantize(x, scale, zero, eps=1e-9):
     return scale * (x - zero)
 
 
-class Quantizer(nn.Module):
+class SpQRQuantizer(nn.Module):
     def __init__(self, shape=1):
-        super(Quantizer, self).__init__()
+        super(SpQRQuantizer, self).__init__()
         self.register_buffer("maxq", torch.tensor(0))
         self.register_buffer("scale", torch.zeros(shape))
         self.register_buffer("zero", torch.zeros(shape))
@@ -102,7 +102,7 @@ class Quantizer(nn.Module):
 
         if self.qq_scale_bits is not None:
             scale_groups = self.scale.reshape(-1, self.qq_groupsize)
-            self.qq_scale = Quantizer(shape=scale_groups.shape)
+            self.qq_scale = SpQRQuantizer(shape=scale_groups.shape)
             self.qq_scale.configure(self.qq_scale_bits, perchannel=True, sym=False, round_zero=False, **self.qqq_params)
             self.qq_scale.find_params(scale_groups, weight=True)
             assert self.qq_scale.scale.shape == (scale_groups.shape[0], 1), self.qq_scale.scale.shape
@@ -111,7 +111,7 @@ class Quantizer(nn.Module):
 
         if self.qq_zero_bits is not None and ((not self.round_zero) or self.qq_zero_bits < self.bits):
             zero_groups = self.zero.reshape(-1, self.qq_groupsize)
-            self.qq_zero = Quantizer(shape=zero_groups.shape)
+            self.qq_zero = SpQRQuantizer(shape=zero_groups.shape)
             self.qq_zero.configure(
                 self.qq_zero_bits, perchannel=True, sym=self.qq_zero_sym, round_zero=False, **self.qqq_params
             )

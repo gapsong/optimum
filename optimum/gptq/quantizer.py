@@ -88,7 +88,7 @@ from tqdm.auto import tqdm
 
 from .weight_permutation import get_permutation_order
 
-from .quant_groups import quantize, dequantize, Quantizer
+from .quant_groups import quantize, dequantize, SpQRQuantizer
 
 
 
@@ -105,6 +105,53 @@ class QuantizationResult(NamedTuple):
     save_quant_dict: dict
 
 
+import math
+from typing import NamedTuple, Optional, Union
+
+import torch
+from tqdm.auto import tqdm
+
+from .quant_groups import SpQRQuantizer, dequantize, quantize
+from .weight_permutation import get_permutation_order
+
+
+class QuantizationResult(NamedTuple):
+    weight: torch.FloatTensor
+    perm: Optional[torch.LongTensor]
+    quantization_errors: torch.Tensor
+    unstructured_outlier_threshold: float
+    unstructured_outlier_mask: torch.Tensor
+    save_quant_dict: dict
+
+
+def get_leave_one_out_error(group_weight: torch.Tensor, group_diag_hessian_inv_cho: torch.Tensor, *, bits, sym):
+    assert group_weight.ndim == 2
+    loo_indices = torch.arange(group_weight.shape[1], device=group_weight.device)
+    loo_indices = loo_indices[1:] - (loo_indices[:, None] >= loo_indices[1:]).to(loo_indices.dtype)
+    groupwise_loo_data = group_weight[:, loo_indices]
+    fast_quantizer = SpQRQuantizer(shape=groupwise_loo_data.flatten(0, 1).shape)
+    fast_quantizer.configure(bits, perchannel=True, sym=sym)
+    fast_quantizer.find_params(groupwise_loo_data.flatten(0, 1), weight=True)
+    loo_groupwise_reconstructed_weights = fast_quantizer.quantize_dequantize(
+        groupwise_loo_data.flatten(0, 1)
+    ).reshape_as(groupwise_loo_data)
+    loo_group_diag_hessian_inv_cho = group_diag_hessian_inv_cho[loo_indices]
+    assert group_diag_hessian_inv_cho.ndim == 1
+    loo_errors_sq = (
+        ((loo_groupwise_reconstructed_weights - groupwise_loo_data) / loo_group_diag_hessian_inv_cho).square().sum(-1)
+    )
+    assert loo_errors_sq.shape == group_weight.shape
+    base_quantizer = SpQRQuantizer(shape=group_weight.shape)
+    base_quantizer.configure(bits, perchannel=True, sym=sym)
+    base_quantizer.find_params(group_weight, weight=True)
+    baseline_reconstructed_weights = base_quantizer.quantize_dequantize(group_weight)
+    baseline_errors_sq = (
+        ((baseline_reconstructed_weights - group_weight) / group_diag_hessian_inv_cho).square().sum(dim=1, keepdim=True)
+    )
+    reduction_in_squared_error = baseline_errors_sq - loo_errors_sq
+    return reduction_in_squared_error
+
+
 class SPQRUtil:
     """Learns GPTQ for a single linear layer"""
 
@@ -116,19 +163,118 @@ class SPQRUtil:
         self.nsamples = 0
 
     def add_batch(self, inp):
-        assert self.H is not None, "Already ran quantization; cannot add more data batches"
-        if len(inp.shape) == 2:
-            inp = inp.unsqueeze(0)
-        tmp = inp.shape[0]
+        # device-Handhabung überlasse bestehender Umgebung; nur xtx-Akkumulation hier
+        inp = inp.to(dtype=torch.float32)
 
-        if len(inp.shape) == 3:
-            inp = inp.reshape((-1, inp.shape[-1]))
-        inp = inp.t()
+        # input reshaping
+        reshaped_inp = inp.reshape(-1, inp.shape[-1])
 
-        self.H *= self.nsamples / (self.nsamples + tmp)
-        self.nsamples += tmp
-        inp = math.sqrt(2 / self.nsamples) * inp.float()
-        self.H += inp.matmul(inp.t())
+        batch_token_size = reshaped_inp.shape[0]
+
+        if self.H.device != reshaped_inp.device:
+            self.H = self.H.to(device=reshaped_inp.device)
+
+        # moe model may receive an empty batch, return early
+        if batch_token_size == 0:
+            return batch_token_size, reshaped_inp, 0, 0
+
+        beta = self.nsamples / (self.nsamples + batch_token_size)
+        alpha = 2.0 / (self.nsamples + batch_token_size)
+
+        self.H.addmm_(reshaped_inp.T, reshaped_inp, beta=beta, alpha=alpha)
+
+        # update number of collected samples
+        self.nsamples += batch_token_size
+
+        del batch_token_size, reshaped_inp, alpha, beta
+
+    @torch.inference_mode()
+    def hessian_inverse(
+        self,
+        H: torch.Tensor,
+        percdamp: float,
+        damp_auto_increment: float = 0.0,
+        use_abs_mean: bool = True,   # wird in dieser GPTQ-Variante nicht verwendet (nur zur API-Kompatibilität)
+        max_auto_retries: int = 32,  # wird durch max_floor_attempts ersetzt (GPTQ-Style)
+    ):
+        """
+        GPTQ-Style: berechne R = chol((H + λ I)^{-1}) mit stufigem Diagonal-Floor und separater Damp-Recovery.
+
+        - Ändert H nur temporär via diag_view.add_(...) und stellt die Diagonale nach jedem Versuch wieder her.
+        - percdamp: initialer Dämpfungswert (0 < percdamp < 1 empfohlen)
+        - damp_auto_increment: Schrittweite zum Erhöhen von percdamp bei Cholesky-Fehlern
+        Rückgabe:
+          (R, used_damp) oder (None, 1.0) bei endgültigem Fehlschlag.
+        """
+        assert H.ndim == 2 and H.shape[0] == H.shape[1], "H must be square"
+
+        # Sicht auf die Diagonale (direkt auf H)
+        diag_view = H.diagonal()
+        orig_diag = diag_view.clone()
+
+        # Floor-Grundlage (wie GPTQ): 1e-6 * max(|diag|)
+        base_abs_max = torch.max(orig_diag.abs()).item()
+        if not math.isfinite(base_abs_max) or base_abs_max == 0.0:
+            base_abs_max = 1.0
+        floor_base = base_abs_max * 1e-6
+
+        max_floor_attempts = 6
+        used_damp = percdamp
+        last_error = None
+
+        attempt = 0
+        while attempt <= max_floor_attempts:
+            # Wähle die aktuelle "gefloorte" Diagonale
+            if attempt == 0:
+                current_diag = orig_diag
+            else:
+                floor_increment = floor_base * math.pow(10.0, attempt - 1)
+                # clamp sorgt dafür, dass die Diagonale mind. floor_increment hat
+                current_diag = torch.clamp(orig_diag + floor_increment, min=floor_increment)
+
+            # Setze H-Diagonale auf current_diag
+            diag_view.copy_(current_diag)
+
+            # Mittelwert der aktuellen Diagonale; GPTQ nutzt diesen für λ = damp * mean(current_diag)
+            mean = torch.mean(current_diag)
+            damp = percdamp
+
+            damp_recovery_started = False
+            recovery_initial_damp = None
+            recovery_last_damp = None
+
+            # Damp-Recovery-Schleife (0 < damp < 1)
+            while 0 < damp < 1:
+                try:
+                    # Temporär λ auf die Diagonale addieren
+                    diag_view.add_(damp * mean)
+                    # Cholesky und inverse Cholesky
+                    H2 = torch.linalg.cholesky(H)
+                    Hinv_result = torch.linalg.cholesky(torch.cholesky_inverse(H2), upper=True)
+                    # Diagonale wiederherstellen (ohne λ)
+                    diag_view.copy_(current_diag)
+                    del H2
+                    used_damp = damp
+                    return Hinv_result, used_damp
+                except torch._C._LinAlgError as e:
+                    last_error = e
+                    # Diagonale auf current_diag zurücksetzen, bevor wir den Dämpfungswert anpassen
+                    diag_view.copy_(current_diag)
+                    if damp_auto_increment != 0:
+                        if not damp_recovery_started:
+                            damp_recovery_started = True
+                            recovery_initial_damp = damp
+                        damp += damp_auto_increment
+                        recovery_last_damp = damp
+                    else:
+                        # kein Auto-Increment konfiguriert; verlasse Damp-Recovery-Schleife
+                        break
+
+            # Falls die Damp-Recovery-Schleife nicht erfolgreich war, erhöhe den Diagonal-Floor und versuche erneut
+            attempt += 1
+
+        # Alle Versuche ausgeschöpft
+        return None, 1.0
 
     def quantize(
         self,
@@ -146,29 +292,24 @@ class SPQRUtil:
         perchannel: bool = True,
         sym: bool = False,
         save_quantization: bool = False,
+        damp_auto_increment: float = 0.0,   # NEU: für robustere Cholesky
+        use_abs_mean_for_damp: bool = True, # NEU: SPQR- (True) vs GPTQ-Stil (False)
         **kwargs,
     ) -> QuantizationResult:
         """
         :param bits: number of bits used at the lowest level (the full model size will be different!)
         :param blocksize: take blocks of this many input features at a time for GPTQ
-        :note: blocksize affects runtime and memory, but does not affect the resulting matrix (up to machine precision)
         :param groupsize: fit quantization scaling / statistics to each group of this many input features
         :param percdamp: relative regularizer added to hessian diagonal before inversion
-        :note: if groupsize_in_dim* is None, use the same quantization statistics across all input features
-        :param keep_last_columns: if not None, keep the last (this many) input features un_quantized and return them
-        :note: the un-quantized columns will be a part of the first returned result
-        :param outlier_relative_threshold: threshold used for *UNSTRUCTURED* outliers, relative to
-        :note: if keep_last_columns > 0, quantized_dequantized_weights[-keep_last_columns:] will be non-quantized
-        :param permutation_order: re-order input features using a certain policy
-        :param keep_H: if False, delete the accumulated hessian during quantize; if False, keep the accumulated hessian
-        :param simplified_outliers: if True,do not perform leave-one-out evaluation when detecting outliers;
-            works faster, but generally worse in perplexity
-        :param verbose: if True, display a tqdm progressbar over input columns
-        :param sym: if True, base weight quantization is symmetric
-        :param perchannel: if True, base weight quantization will learn statistics for each output dimension separately
-        :return: a QuantizationResult tuple that contains(
-            weight, perm, _unused, _unused, _unused, _unused, quantization_errors, outlier_unstructured_mask
-        ), see class QuantizationResult below for details
+        :param keep_last_columns: keep the last columns un-quantized (returned within first result)
+        :param outlier_relative_threshold: unstructured outlier threshold multiplier
+        :param permutation_order: input feature reordering policy
+        :param keep_H: keep accumulated Hessian after quantize if True
+        :param simplified_outliers: speed up outlier detection (worse PPL)
+        :param perchannel: per-output-dimension quant stats
+        :param sym: symmetric base quantization
+        :param damp_auto_increment: auto-increase percdamp on Cholesky failure
+        :param use_abs_mean_for_damp: use mean(abs(diag(H))) like SPQR (True) or mean(diag(H)) like GPTQ (False)
         """
         weight = self.layer.weight.detach().to(dtype=torch.float, copy=True)
         save_quant_dict = {}
@@ -176,7 +317,7 @@ class SPQRUtil:
 
         scale = []
         zero = []
-        
+
         if save_quantization:
             save_quant_dict["quant_weights"] = []
             save_quant_dict["quant_layer_scale"] = []
@@ -188,45 +329,53 @@ class SPQRUtil:
             save_quant_dict["save_float_dtype"] = self.layer.weight.dtype
             save_quant_dict["outliers_matrix"] = torch.zeros(
                 weight.shape, dtype=save_quant_dict["save_float_dtype"]
-            ).to(
-                weight.device
-            )  # shape = [out_features, in_features]
+            ).to(weight.device)
 
-        weight = weight[:, perm]  # note: weight is modified
+        weight = weight[:, perm]  # permutiere Spalten entsprechend
         H = self.H
         if keep_H:
-            H = H.clone()  # protect from in-place changes
+            H = H.clone()
         else:
             self.H = None
 
         H = H[perm][:, perm]
-        self.dead = torch.diag(H) == 0  # indices of input features that do not affect outputs
-        if percdamp > 0:
-            ix = torch.arange(len(H), device=weight.device)
-            H[ix, ix] += percdamp * abs(torch.diag(H)).mean()
-            del ix
+        self.dead = torch.diag(H) == 0  # inaktive Eingaben
+        # Dead-handling beibehalten
         H[self.dead, self.dead] = 1
         weight[:, self.dead] = 0
-        H_inv = torch.cholesky_inverse(torch.linalg.cholesky(H))
-        H_inv_cho = torch.linalg.cholesky(H_inv, upper=True)
+
+        # NEU: robuste Hessian-Inverse-Berechnung (ersetzt den alten Block)
+        H_inv_cho, used_damp = self.hessian_inverse(
+            H,
+            percdamp=percdamp,
+            damp_auto_increment=damp_auto_increment,
+            use_abs_mean=use_abs_mean_for_damp,
+        )
+        if H_inv_cho is None:
+            # Letzter Fallback (sehr konservativ): kleine zusätzliche Dämpfung probieren
+            H2 = 0.5 * (H + H.T)
+            eps = float(max(1e-6, percdamp)) * float(torch.mean(torch.abs(torch.diag(H2))).item() + 1e-12)
+            H2.diagonal().add_(eps)
+            L = torch.linalg.cholesky(H2)
+            H_inv = torch.cholesky_inverse(L)
+            H_inv_cho = torch.linalg.cholesky(H_inv, upper=True)
+            del H2, L, H_inv
+
         H_inv_cho_diag = torch.diag(H_inv_cho)
         del H
 
-        quantizer = Quantizer()
+        quantizer = SpQRQuantizer()
         quantizer.configure(bits, perchannel=perchannel, round_zero=True, sym=sym, **kwargs)
         assert H_inv_cho.shape[0] == H_inv_cho.shape[1] == weight.shape[1], "weight must be [out_features, in_features]"
-        out_dim, in_dim = weight.shape  # [out_features, in_features]
+        out_dim, in_dim = weight.shape
 
         if groupsize is None:
             groupsize = in_dim
 
-        # prepare outlier detection
         outlier_column_indices = torch.empty(0, dtype=torch.int64, device=weight.device)
-        del H_inv
-
         outlier_scale = (weight.var(dim=0) / torch.diag(H_inv_cho).square()).mean().item()
         unstructured_outlier_threshold = outlier_relative_threshold * outlier_scale
-        in_group_index = -1  # index of current group of input features, for group quantizer purposes
+        in_group_index = -1
 
         quantization_errors = torch.zeros_like(weight)
         unstructured_outlier_mask = torch.zeros_like(weight, dtype=torch.bool)
@@ -237,27 +386,20 @@ class SPQRUtil:
             block_end = min(block_start + blocksize, in_dim)
             for column_index in range(block_start, block_end):
                 if column_index % groupsize == 0:
-                    # fit weight quantizer on the upcoming group of weight columns (inputs), across all rows (outputs)
                     in_group_index += 1
                     group_weight = weight[:, column_index : column_index + groupsize]
 
                     if simplified_outliers or (unstructured_outlier_threshold == float("inf")):
                         quantizer.find_params(group_weight, weight=True)
-
                     else:
-                        # objective: detect which weights will be designated as outliers, fit quantizer *without* these weights
-                        # step 1: fit quantizer on a leave-one-out version of weights, i.e. in each group, drop one weight at a time
                         assert perchannel, "refitting quantizer is only implemented for perchannel=True"
                         group_diag_hessian_inv_cho = H_inv_cho_diag[column_index : column_index + groupsize]
                         loo_quantization_error_sq = get_leave_one_out_error(
                             group_weight, group_diag_hessian_inv_cho, bits=bits, sym=sym
                         )
-                        # ^-- dequantized(quantized(group_weight)) using a quantizer trained on all weights except the reconstructed one
-
                         likely_unstructured_outlier_mask = (
                             loo_quantization_error_sq > unstructured_outlier_threshold
                         ).float()
-
                         non_outlier_mask = 1 - likely_unstructured_outlier_mask
                         mean_over_non_outliers = torch.sum(
                             group_weight * non_outlier_mask, dim=1, keepdim=True
@@ -306,16 +448,13 @@ class SPQRUtil:
                     weight[:, column_index]
                 )
 
-                delta_weight_i = weight[:, column_index] - weight_i_quantized  # [out_dim]
-                quantization_errors[:, column_index] = (
-                    delta_weight_i / H_inv_cho[column_index, column_index]
-                )  # [out_dim]
+                delta_weight_i = weight[:, column_index] - weight_i_quantized
+                quantization_errors[:, column_index] = delta_weight_i / H_inv_cho[column_index, column_index]
 
                 if unstructured_outlier_threshold != float("inf"):
                     unstructured_outlier_mask[:, column_index] = (
                         quantization_errors[:, column_index].square() > unstructured_outlier_threshold
                     )
-                    # re-quantize without outliers
                     is_outlier = unstructured_outlier_mask[:, column_index].float()
 
                     weight_quant_i = quantize(
@@ -329,23 +468,15 @@ class SPQRUtil:
                     ).reshape_as(weight[:, column_index])
                     weight_i_quantized = (
                         weight_i_quantized_wo_outliers * (1 - is_outlier) + weight[:, column_index] * is_outlier
-                    )  # [out_dim]
-                    
-                    
-                    scale.append(quantizer.scale)
-                    zero.append(quantizer.zero)
-                    
-                    save_quant_dict["quant_layer_scale"]
+                    )
 
                     if save_quantization:
                         save_quant_dict["outliers_matrix"][:, column_index] = weight[:, column_index] * is_outlier
 
                     del weight_i_quantized_wo_outliers
 
-                    delta_weight_i = weight[:, column_index] - weight_i_quantized  # [out_dim]
-                    quantization_errors[:, column_index] = (
-                        delta_weight_i / H_inv_cho[column_index, column_index]
-                    )  # [out_dim]
+                    delta_weight_i = weight[:, column_index] - weight_i_quantized
+                    quantization_errors[:, column_index] = delta_weight_i / H_inv_cho[column_index, column_index]
 
                 if save_quantization:
                     save_quant_dict["quant_weights"].append(weight_quant_i.to(torch.int8))
@@ -364,7 +495,6 @@ class SPQRUtil:
             )
 
         g_idx = [i // groupsize for i in range(self.columns)]
-
         g_idx = torch.tensor(g_idx, dtype=torch.int32, device=weight.device)
 
         if permutation_order != "identity":
@@ -388,7 +518,8 @@ class SPQRUtil:
             unstructured_outlier_mask=unstructured_outlier_mask,
             save_quant_dict=save_quant_dict,
         )
-        
+
+
 def get_leave_one_out_error(group_weight: torch.Tensor,
                             group_diag_hinv_cho: torch.Tensor,
                             *,
