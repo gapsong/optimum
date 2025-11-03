@@ -3,12 +3,12 @@ import torch.nn as nn
 
 
 def quantize_dequantize(x, scale, zero, maxq, eps=1e-9):
-    q = torch.clamp(torch.round(x / scale.clamp_min(eps) + zero), 0, maxq)
+    q = torch.clamp(torch.round(x / scale.clamp_min(eps)) + zero, 0, maxq)
     return scale * (q - zero)
 
 
 def quantize(x, scale, zero, maxq, eps=1e-9):
-    q = torch.clamp(torch.round(x / scale.clamp_min(eps) + zero), 0, maxq)
+    q = torch.clamp(torch.round(x / scale.clamp_min(eps)) + zero, 0, maxq)
     return q
 
 
@@ -38,6 +38,7 @@ class SpQRQuantizer(nn.Module):
         qq_zero_sym=False,
         reserved_bins: int = 0,
         qqq_params=None,
+        include_zero_in_range=True,
     ):
         self.bits = bits
         self.maxq = torch.tensor(2**bits - 1 - reserved_bins)
@@ -53,6 +54,7 @@ class SpQRQuantizer(nn.Module):
         self.qq_zero_sym = qq_zero_sym
         self.qq_groupsize = qq_groupsize
         self.qqq_params = qqq_params or {}
+        self.include_zero_in_range = include_zero_in_range  # NEU
 
     def find_params(self, x, weight=False):
         dev = x.device
@@ -65,8 +67,7 @@ class SpQRQuantizer(nn.Module):
                 x = x.flatten(1)
             else:
                 if len(shape) == 4:
-                    x = x.permute([1, 0, 2, 3])
-                    x = x.flatten(1)
+                    x = x.permute([1, 0, 2, 3]).flatten(1)
                 if len(shape) == 3:
                     x = x.reshape((-1, shape[-1])).t()
                 if len(shape) == 2:
@@ -74,15 +75,29 @@ class SpQRQuantizer(nn.Module):
         else:
             x = x.flatten().unsqueeze(0)
 
-        xmin = x.min(1).values
-        xmax = x.max(1).values
+        if self.include_zero_in_range:
+            # GPTQ-Style: 0 in Range erzwingen
+            tmp0 = torch.zeros(x.shape[0], device=dev)
+            xmin = torch.minimum(x.min(1).values, tmp0)
+            xmax = torch.maximum(x.max(1).values, tmp0)
+        else:
+            # SPQR-Style: reiner Datenbereich
+            xmin = x.min(1).values
+            xmax = x.max(1).values
 
         if self.sym:
             xmax = torch.maximum(torch.abs(xmin), xmax)
             tmp = xmin < 0
             if torch.any(tmp):
                 xmin[tmp] = -xmax[tmp]
-        tmp = xmin == xmax
+
+        # Degenerats behandeln:
+        if self.include_zero_in_range:
+            # GPTQ-Style: nur wenn beide 0
+            tmp = (xmin == 0) & (xmax == 0)
+        else:
+            # SPQR-Style: wenn min == max
+            tmp = xmin == xmax
         xmin[tmp] = -1
         xmax[tmp] = +1
 
@@ -90,8 +105,9 @@ class SpQRQuantizer(nn.Module):
         if self.sym:
             self.zero = torch.full_like(self.scale, (self.maxq + 1) / 2)
         else:
-            self.zero = maybe_round_zero(-xmin / self.scale)
+            self.zero = maybe_round_zero(-xmin / self.scale.clamp_min(1e-9))
 
+        # Rest unverändert …
         if not self.perchannel:
             if weight:
                 tmp = shape[0]
