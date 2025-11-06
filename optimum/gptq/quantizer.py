@@ -168,6 +168,9 @@ class SPQRUtil:
 
         # input reshaping
         reshaped_inp = inp.reshape(-1, inp.shape[-1])
+        if not torch.isfinite(reshaped_inp).all():
+            bad = (~torch.isfinite(reshaped_inp)).sum().item()
+            raise RuntimeError(f"add_batch: input contains {bad} non-finite values (NaN/Inf). Aborting.")
 
         batch_token_size = reshaped_inp.shape[0]
 
@@ -180,9 +183,12 @@ class SPQRUtil:
 
         beta = self.nsamples / (self.nsamples + batch_token_size)
         alpha = 2.0 / (self.nsamples + batch_token_size)
-
+        
         self.H.addmm_(reshaped_inp.T, reshaped_inp, beta=beta, alpha=alpha)
 
+        if not torch.isfinite(self.H).all():
+            badH = (~torch.isfinite(self.H)).sum().item()
+            raise RuntimeError(f"add_batch: H became non-finite after addmm ({badH} elements). Aborting.")
         # update number of collected samples
         self.nsamples += batch_token_size
 
@@ -378,6 +384,7 @@ class SPQRUtil:
 
             # GPTQ-Style: Blockkopie + Block-Hinv
             W1 = weight[:, block_start:block_end].clone()
+            outlier_mask = torch.zeros_like(W1, dtype=torch.bool)
             Hinv1 = H_inv_cho[block_start:block_end, block_start:block_end]
             errors1 = torch.zeros_like(W1)
 
@@ -390,6 +397,7 @@ class SPQRUtil:
                     in_group_index += 1
                     group_rel_end = min(i_rel + groupsize, block_size)
                     group_weight = W1[:, i_rel:group_rel_end]  # GPTQ: auf korrigierter Arbeitsmatrix
+                    # group_mask = None
                     if simplified_outliers or (unstructured_outlier_threshold == float("inf")):
                         quantizer.find_params(group_weight.float(), weight=True)
                     else:
@@ -408,32 +416,9 @@ class SPQRUtil:
                         group_weight_without_outliers = group_weight * non_outlier_mask + mean_over_non_outliers * (
                             1 - non_outlier_mask
                         )
-                        # print(f"Mein Outlierwerte sind folgende: {sum(sum(group_weight_without_outliers)) == sum(sum(group_weight))}")
+                        outlier_mask[:, i_rel:group_rel_end] = likely_unstructured_outlier_mask
                         quantizer.find_params(group_weight_without_outliers.float(), weight=True)
-                        # quantizer2.find_params(group_weight.float(), weight=True)
-                        G = group_weight.float()
-                        G_wo = group_weight_without_outliers.float()
 
-                        if (G != G_wo).any().item():
-                            print("any outliers in group:", (G != G_wo).any().item())
-                            print("allclose(G, G_wo):", torch.allclose(G, G_wo, rtol=1e-6, atol=1e-6))
-
-                            xmin, xmax = G.min(dim=1).values, G.max(dim=1).values
-                            xmin_wo, xmax_wo = G_wo.min(dim=1).values, G_wo.max(dim=1).values
-
-                            changed_min = (xmin != xmin_wo).sum().item()
-                            changed_max = (xmax != xmax_wo).sum().item()
-                            print("rows mit verändertem xmin/xmax:", changed_min, changed_max)
-
-                            maxq = quantizer.maxq
-                            scale     = (xmax    - xmin   ) / maxq
-                            scale_wo  = (xmax_wo - xmin_wo) / maxq
-                            zero      = torch.round(-xmin    / scale.clamp_min(1e-9)).clamp_(0, maxq)
-                            zero_wo   = torch.round(-xmin_wo / scale_wo.clamp_min(1e-9)).clamp_(0, maxq)
-
-                            print("max rel scale diff:", ((scale_wo - scale).abs() / scale.clamp_min(1e-12)).max().item())
-                            print("zero changed rows:", (zero_wo != zero).sum().item())
-                        del G, G_wo, group_weight
                         del group_diag_hessian_inv_cho, loo_quantization_error_sq
                         del mean_over_non_outliers, group_weight_without_outliers, non_outlier_mask
 
@@ -478,14 +463,11 @@ class SPQRUtil:
                     weight_quant_i, quantizer.scale, quantizer.zero
                 ).reshape_as(w)
 
-                # Fehler und optionales Outlier-Handling (falls aktiviert)
-                delta_weight_i = w - weight_i_quantized
-                err = delta_weight_i / d
 
                 if unstructured_outlier_threshold != float("inf"):
-                    err_sq = (delta_weight_i.square()) / (d * d)
-                    is_outlier_mask = err_sq > unstructured_outlier_threshold
-                    is_outlier = is_outlier_mask.float()
+                    # Block-lokale Maske lesen (bool) und global speichern
+                    is_outlier_mask = outlier_mask[:, i_rel]           # bool
+                    is_outlier = is_outlier_mask.float()               # float für Rechen-OPs
                     unstructured_outlier_mask[:, column_index] = is_outlier_mask
 
                     weight_quant_i = quantize(
@@ -500,9 +482,11 @@ class SPQRUtil:
                     if save_quantization:
                         save_quant_dict["outliers_matrix"][:, column_index] = w.detach() * is_outlier
 
-                    delta_weight_i = w - weight_i_quantized
-                    err = delta_weight_i / d
                     del weight_i_quantized_wo_outliers
+                
+                # Fehler und optionales Outlier-Handling (falls aktiviert)
+                delta_weight_i = w - weight_i_quantized
+                err = delta_weight_i / d.clamp_min(1e-12)
 
                 # Fehler speichern (relativ)
                 errors1[:, i_rel] = err
@@ -937,7 +921,7 @@ class GPTQQuantizer(object):
                         bits=self.bits,
                         # kleiner Blocksize für Stabilität; später tunen
                         blocksize=128,
-                        percdamp=self.damp_percent,
+                        percdamp=0.015,
                         # GPTQ: group_size==-1 => per-column; SPQR groupsize=None => ein Group; minimal kompatibel
                         groupsize=None if self.group_size == -1 else self.group_size,
                         permutation_order="identity" if not self.desc_act else "identity",  # TODO: act_order später
@@ -945,7 +929,7 @@ class GPTQQuantizer(object):
                         sym=self.sym,
                         verbose=False,
                         save_quantization=True,
-                        outlier_relative_threshold=0.01
+                        outlier_relative_threshold=1000
                     )
 
                     scale, zero, g_idx, outlier_matrix  = res.save_quant_dict["quant_layer_scale"], res.save_quant_dict["quant_layer_zeros"], res.save_quant_dict["g_idx"], res.save_quant_dict["outliers_matrix"]
