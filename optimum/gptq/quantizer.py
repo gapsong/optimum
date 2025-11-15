@@ -445,7 +445,8 @@ class GPTQQuantizer(object):
             lora_b_key = base_key + ".lora_B.weight"
 
             if lora_b_key in adapter_state_dict:
-                lora_A = adapter_state_dict[lora_a_key]
+                lora_A = adapter_state_dict[lora_a_key].repeat_interleave(adapter_config.get("qalora_group_size"), dim=1)
+                # lora_A = adapter_state_dict[lora_a_key]
                 lora_B = adapter_state_dict[lora_b_key]
                 
                 # Dies ist die Kernlogik Ihrer Anfrage
