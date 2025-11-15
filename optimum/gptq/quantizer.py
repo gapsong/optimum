@@ -707,6 +707,7 @@ class GPTQQuantizer(object):
 
         # Step 3: Quantize the blocks
         quantizers = {}
+        all_hessian_inverse_layers = {}
         if not self.lr_layers and self.apply_error_correction and adapter_path is not None:
             # adapter_path = "/home/nudel/Documents/peft/train_results_debugger/quantized_residuals_r128/daniel_adapter_r128_TinyLlama_TinyLlama_v1.1"
             self.lr_layers = self.load_all_lr_layers(adapter_path)
@@ -786,7 +787,9 @@ class GPTQQuantizer(object):
                     quant_outputs = gptq[name].fasterquant(
                         percdamp=self.damp_percent, group_size=self.group_size, actorder=self.desc_act
                     )
-                    scale, zero, g_idx = quant_outputs[0], quant_outputs[1], quant_outputs[2]
+                    scale, zero, g_idx, Hinv = quant_outputs[0], quant_outputs[1], quant_outputs[2], quant_outputs[6]
+                    # Store the Hessian inverse for each quantized layer
+                    all_hessian_inverse_layers[f"{self.block_name_to_quantize}.{i}.{name}"] = Hinv.to(torch.float16).to("cpu")
                     quantizers[f"{self.block_name_to_quantize}.{i}.{name}"] = (
                         gptq[name].quantizer,
                         scale,
@@ -844,6 +847,8 @@ class GPTQQuantizer(object):
         if has_config:
             model.config.use_cache = use_cache
             model.config.quantization_config = self.to_dict()
+
+        model.all_hessian_inverse_layers = all_hessian_inverse_layers
 
         # Step 5: Any post-initialization that require device information, for example buffers initialization on device.
         model = self.post_init_model(model)
