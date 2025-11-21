@@ -788,9 +788,10 @@ class GPTQQuantizer(object):
                     quant_outputs = gptq[name].fasterquant(
                         percdamp=self.damp_percent, group_size=self.group_size, actorder=self.desc_act
                     )
-                    scale, zero, g_idx, Hinv = quant_outputs[0], quant_outputs[1], quant_outputs[2], quant_outputs[6]
+                    # scale, zero, g_idx, Hinv = quant_outputs[0], quant_outputs[1], quant_outputs[2], quant_outputs[6]
+                    scale, zero, g_idx = quant_outputs[0], quant_outputs[1], quant_outputs[2]
                     # Store the Hessian inverse for each quantized layer
-                    all_hessian_inverse_layers[f"{self.block_name_to_quantize}.{i}.{name}"] = Hinv.to(torch.float16).to("cpu")
+                    # all_hessian_inverse_layers[f"{self.block_name_to_quantize}.{i}.{name}"] = Hinv.to(torch.float16).to("cpu")
                     quantizers[f"{self.block_name_to_quantize}.{i}.{name}"] = (
                         gptq[name].quantizer,
                         scale,
@@ -849,7 +850,7 @@ class GPTQQuantizer(object):
             model.config.use_cache = use_cache
             model.config.quantization_config = self.to_dict()
 
-        model.all_hessian_inverse_layers = all_hessian_inverse_layers
+        # model.all_hessian_inverse_layers = all_hessian_inverse_layers
 
         # Step 5: Any post-initialization that require device information, for example buffers initialization on device.
         model = self.post_init_model(model)
